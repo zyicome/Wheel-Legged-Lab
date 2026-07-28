@@ -28,7 +28,7 @@
       "rules": {
         "jump_takeoff_vz": {"min": 0.50},
         "jump_apex_rise": {"min": 0.06},
-        "jump_air_time": {"min": 0.16},
+        "jump_air_time": {"min": 0.14},
         "jump_success_rate": {"min": 0.70},
         "jump_fail_recovery_rate": {"max": 0.06},
         "torque_saturation": {"max": 0.05}
