@@ -3,9 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""
-Python module serving as a project/extension template.
-"""
+"""Isaac Lab extension for wheel-legged robot locomotion and jump learning."""
 
 # Register Gym environments.
 from .tasks import *

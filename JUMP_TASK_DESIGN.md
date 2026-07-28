@@ -454,7 +454,7 @@ Stage B2 checkpoint。它不会修改原来的 `Wheel-Legged-Jump-Flat-v0`。
 推荐从 Stage B2 的 `model_700.pt` 只迁移网络权重：
 
 ```bash
-cd /home/zyicome/zyb/Isaaclab/wheel_legged_lab/wheel_legged_robot
+cd Wheel-Legged-Lab
 
 python scripts/rsl_rl/train.py \
   --task Wheel-Legged-Jump-High-Landing-Flat-v0 \
@@ -519,7 +519,7 @@ FLIGHT 阶段仍保留 55% 支撑前馈；轮腿在到达 apex 前已经重新�
 从目前 Stage C1 最佳模型迁移：
 
 ```bash
-cd /home/zyicome/zyb/Isaaclab/wheel_legged_lab/wheel_legged_robot
+cd Wheel-Legged-Lab
 
 python scripts/rsl_rl/train.py \
   --task Wheel-Legged-Jump-Clearance-Flat-v0 \
@@ -614,7 +614,7 @@ wz = [-0.20, 0.20] rad/s
 从 Stage C2 最新 checkpoint 迁移：
 
 ```bash
-cd /home/zyicome/zyb/Isaaclab/wheel_legged_lab/wheel_legged_robot
+cd Wheel-Legged-Lab
 
 python scripts/rsl_rl/train.py \
   --task Wheel-Legged-Jump-Moving-Flat-v0 \
@@ -749,7 +749,7 @@ MJ连过  当前连续通过窗口数
 从 C3-L1 `model_700.pt` 迁移：
 
 ```bash
-cd /home/zyicome/zyb/Isaaclab/wheel_legged_lab/wheel_legged_robot
+cd Wheel-Legged-Lab
 
 python scripts/rsl_rl/train.py \
   --task Wheel-Legged-Jump-Moving-Curriculum-Flat-v0 \

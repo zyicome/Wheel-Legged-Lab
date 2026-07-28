@@ -8,7 +8,7 @@
 import os
 
 import toml
-from setuptools import setup
+from setuptools import find_packages, setup
 
 # Obtain the extension data from the extension.toml file
 EXTENSION_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -24,7 +24,7 @@ INSTALL_REQUIRES = [
 # Installation operation
 setup(
     name="wheel_legged_robot",
-    packages=["wheel_legged_robot"],
+    packages=find_packages(),
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],
@@ -34,6 +34,15 @@ setup(
     install_requires=INSTALL_REQUIRES,
     license="Apache-2.0",
     include_package_data=True,
+    package_data={
+        "wheel_legged_robot": [
+            "tasks/manager_based/wheel_legged_robot/assets/wheellegged_description/ASSET_LICENSE.md",
+            "tasks/manager_based/wheel_legged_robot/assets/wheellegged_description/LICENSE-BSD-3-Clause",
+            "tasks/manager_based/wheel_legged_robot/assets/wheellegged_description/package.xml",
+            "tasks/manager_based/wheel_legged_robot/assets/wheellegged_description/urdf/*.urdf",
+            "tasks/manager_based/wheel_legged_robot/assets/wheellegged_description/meshes/*.STL",
+        ]
+    },
     python_requires=">=3.10",
     classifiers=[
         "Natural Language :: English",

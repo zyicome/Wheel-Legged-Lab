@@ -21,7 +21,7 @@ Wheel-Legged-Flat-v0
 先进入项目使用的 Isaac Lab Conda 环境，然后执行：
 
 ```bash
-cd /wheel_legged_robot
+cd Wheel-Legged-Lab
 
 ./scripts/rsl_rl/train_staged.sh
 ```

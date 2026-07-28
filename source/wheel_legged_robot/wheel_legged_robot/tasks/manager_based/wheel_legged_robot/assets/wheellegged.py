@@ -2,7 +2,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import DCMotorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
-from robot_lab.assets import ISAACLAB_ASSETS_DATA_DIR
+from . import WHEEL_LEGGED_ASSET_DIR
 
 ##
 # Configuration
@@ -13,7 +13,7 @@ WHEEL_LEGGED_CFG = ArticulationCfg(
         fix_base=False,                     # 必须浮动，用于平衡控制
         merge_fixed_joints=True,            # 合并固定关节（如果有）
         replace_cylinders_with_capsules=True, # 你的连杆不是标准圆柱，保持 False
-        asset_path=f"{ISAACLAB_ASSETS_DATA_DIR}/Robots/wheelleggedrobot/wheellegged_description/urdf/wl_dealed.urdf",
+        asset_path=str(WHEEL_LEGGED_ASSET_DIR / "urdf" / "wl_dealed.urdf"),
         activate_contact_sensors=True,      # 开启轮子接触检测
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,

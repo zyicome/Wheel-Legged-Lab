@@ -68,7 +68,7 @@ from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.dict import print_dict
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: F401
 
-import robot_lab.tasks  # noqa: F401
+import wheel_legged_robot.tasks  # noqa: F401
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

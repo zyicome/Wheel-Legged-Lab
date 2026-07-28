@@ -69,7 +69,7 @@ Wheel-Legged-Jump-Moving-Curriculum-Flat-v0
 ## 项目结构
 
 ```text
-wheel_legged_robot/
+Wheel-Legged-Lab/
 ├── source/wheel_legged_robot/
 │   └── wheel_legged_robot/tasks/manager_based/wheel_legged_robot/
 │       ├── agents/                  # PPO 配置
@@ -122,13 +122,14 @@ wheel_legged_robot/
 
 ### 机器人模型资产
 
-当前开发版本的机器人配置仍通过 `robot_lab.assets.ISAACLAB_ASSETS_DATA_DIR` 读取：
+机器人 URDF 和 STL 已放在扩展内部：
 
 ```text
-Robots/wheelleggedrobot/wheellegged_description/urdf/wl_dealed.urdf
+source/wheel_legged_robot/wheel_legged_robot/tasks/manager_based/
+└── wheel_legged_robot/assets/wheellegged_description/
 ```
 
-因此，公开发布前需要把相应 URDF、STL 与资源许可证整理到本仓库，或者把资产路径改为用户可配置路径。仅上传当前已跟踪文件并不能在另一台机器上完整复现，这是发布前需要优先完成的事项。
+代码通过相对于 Python 包的路径加载模型，不再依赖本地 `robot_lab` 数据目录。机器人模型来自 [clearlab-sustech/Wheel-Legged-Gym](https://github.com/clearlab-sustech/Wheel-Legged-Gym/tree/master/resources/robots/wl)，按上游 BSD 3-Clause 许可证再分发。`wl_dealed.urdf` 在原模型基础上把腿杆碰撞 mesh 替换为 box，以提高仿真稳定性和效率。具体来源、修改和许可证见[资产许可说明](source/wheel_legged_robot/wheel_legged_robot/tasks/manager_based/wheel_legged_robot/assets/wheellegged_description/ASSET_LICENSE.md)。
 
 ## 安装
 
@@ -149,11 +150,11 @@ conda activate env_isaaclab
 
 ### 2. 克隆项目
 
-仓库正式发布后，将下面的地址替换为实际 GitHub 地址：
+克隆本仓库：
 
 ```bash
-git clone <YOUR_GITHUB_REPOSITORY_URL>
-cd wheel_legged_robot
+git clone https://github.com/zyicome/Wheel-Legged-Lab.git
+cd Wheel-Legged-Lab
 ```
 
 ### 3. 安装扩展
@@ -317,13 +318,14 @@ tensorboard --logdir logs/rsl_rl --port 6006
 - 尚未系统验证传感器噪声、通信延迟和执行器热衰减；
 - 目前主要在平坦地面训练，尚未加入完整障碍物感知和自主起跳时机规划；
 - 自动分阶段训练门槛来自当前机器人和已有训练日志，改变质量、尺寸、电机或奖励后需要重新校准；
-- 机器人模型资产尚未完全迁入独立仓库；
+- 机器人模型来自 Wheel-Legged-Gym，相关 BSD 3-Clause 许可证与修改说明已随资产保留；
 - RSL-RL 是当前主要验证后端，CusRL 脚本仍属于实验性支持；
 - 当前结果不能替代多随机种子统计和真实硬件安全验证。
 
 ## Roadmap
 
-- [ ] 整理并发布机器人 URDF、mesh 和资产许可证；
+- [x] 将机器人 URDF 与 mesh 迁入项目并改为包内路径；
+- [x] 补充 Wheel-Legged-Gym 模型来源、修改记录与 BSD 3-Clause 许可证；
 - [ ] 补充训练与 Play 的 GIF/视频；
 - [ ] 发布可复现 checkpoint 与 TensorBoard 曲线；
 - [ ] 增加障碍物地形和目标落点命令；
@@ -361,7 +363,7 @@ tensorboard --logdir logs/rsl_rl --port 6006
 本项目的学习与实现离不开以下优秀开源项目：
 
 - [NVIDIA Isaac Lab](https://github.com/isaac-sim/IsaacLab)：提供基于 Isaac Sim 的机器人学习框架、Manager-Based 环境、传感器、仿真和强化学习接口。
-- [clearlab-sustech/Wheel-Legged-Gym](https://github.com/clearlab-sustech/Wheel-Legged-Gym)（[BSD-3-Clause](https://github.com/clearlab-sustech/Wheel-Legged-Gym/blob/master/LICENSE)）：本项目的轮腿平衡、平移运动和 VMC 相关思路参考了该项目。感谢原作者及贡献者公开轮腿机器人训练实现。
+- [clearlab-sustech/Wheel-Legged-Gym](https://github.com/clearlab-sustech/Wheel-Legged-Gym)（[BSD-3-Clause](https://github.com/clearlab-sustech/Wheel-Legged-Gym/blob/master/LICENSE)）：本项目使用了该项目发布的轮腿机器人 URDF 与 STL，并参考了轮腿平衡、平移运动和 VMC 相关思路。当前使用的 `wl_dealed.urdf` 在原 URDF 上调整了腿杆碰撞几何。感谢原作者及贡献者公开模型和训练实现。
 - [fan-ziqi/robot_lab](https://github.com/fan-ziqi/robot_lab)（[Apache-2.0](https://github.com/fan-ziqi/robot_lab/blob/main/LICENSE)）：本项目在学习 Isaac Lab Manager-Based 任务组织、环境配置和工程结构时参考了该项目。感谢作者及社区提供清晰、丰富的机器人强化学习实践。
 - [RSL-RL](https://github.com/leggedrobotics/rsl_rl)：提供本项目主要使用的 PPO 训练实现。
 
@@ -369,6 +371,6 @@ tensorboard --logdir logs/rsl_rl --port 6006
 
 ## 许可证与免责声明
 
-项目的 Python 包配置目前声明为 Apache-2.0，但根目录正式许可证文件仍需在公开发布前补充并核对。第三方代码、机器人模型和资源文件可能适用各自独立的许可证，使用和再分发时请分别遵守。
+除文件头或第三方组件另有声明外，本项目新增代码采用根目录 [Apache License 2.0](LICENSE)。来自 Wheel-Legged-Gym 的机器人 URDF、STL 及本项目的派生 URDF 继续采用 BSD 3-Clause，完整许可证和修改记录见[资产许可说明](source/wheel_legged_robot/wheel_legged_robot/tasks/manager_based/wheel_legged_robot/assets/wheellegged_description/ASSET_LICENSE.md)。其他第三方代码仍以各文件或上游项目声明为准。
 
 本项目仅供学习与研究。强化学习策略可能输出突变动作或超出预期的控制命令。部署到真实机器人前，请完成限位、力矩、速度、急停、悬挂测试和人员隔离等安全措施。作者不对直接使用本项目导致的设备损坏或人身风险承担责任。
