@@ -1,0 +1,374 @@
+# Wheel-Legged Robot Learning
+
+基于 NVIDIA Isaac Lab 的开链轮腿平衡机器人强化学习项目，包含平移、旋转、原地跳跃、高跳落地、轮端收腿净空，以及边移动边跳跃等任务。
+
+> 这是一个以学习、复现和交流为主要目标的个人项目。作者目前也处于强化学习与机器人控制的入门学习阶段，代码和训练方案难免存在不足。欢迎大家通过 Issue、Discussion 或 Pull Request 一起分析问题、交流经验并完善项目。希望这份从“先站稳、再移动、再跳起来”逐步迭代的记录，能为同样在学习 Isaac Lab 和机器人强化学习的朋友提供一些参考。
+
+## 项目简介
+
+本项目面向一台两腿、两轮的开链轮腿机器人。机器人需要在欠驱动条件下保持机身平衡，并根据速度、高度和跳跃命令完成运动。
+
+项目采用 Isaac Lab 的 Manager-Based 环境组织方式，以 RSL-RL PPO 为主要训练后端，并在腿部控制中加入虚拟模型控制（VMC）。相比直接输出六个关节目标，策略输出左右虚拟腿角、虚拟腿长和轮速参考，再由 VMC 转换为实际关节力矩。
+
+当前已经实现：
+
+- 平地自平衡；
+- 前进、后退与航向控制；
+- 机身高度调节；
+- 速度与航向课程学习；
+- 外部命令触发的六阶段跳跃状态机；
+- 原地小跳、高跳与落地吸能；
+- 空中收腿，提高轮端真实净空；
+- 移动过程中起跳、落地并恢复速度；
+- `0.2 → 0.4 → 0.6 → 0.8 → 1.0 m/s` 移动跳跃课程；
+- 平地模型到跳跃模型的观测维度迁移；
+- 按训练指标自动切换任务的一键分阶段训练；
+- Play 调试指标输出与键盘自由控制；
+- 跳跃开环物理能力测试。
+
+本项目仍是研究与学习性质的仿真工程，尚未完成真实机器人部署和系统性的 Sim-to-Real 验证。
+
+## 训练路线
+
+项目没有把所有能力一次性塞进同一个奖励函数，而是逐步增加难度：
+
+```text
+平移与旋转
+Wheel-Legged-Flat-v0
+        │
+        ▼
+基础原地跳跃
+Wheel-Legged-Jump-Flat-v0
+        │
+        ▼
+高跳与落地强化
+Wheel-Legged-Jump-High-Landing-Flat-v0
+        │
+        ▼
+轮端收腿与净空强化
+Wheel-Legged-Jump-Clearance-Flat-v0
+        │
+        ▼
+移动跳跃课程
+Wheel-Legged-Jump-Moving-Curriculum-Flat-v0
+```
+
+最后得到的是一个带普通移动样本和跳跃样本的统一策略，而不是在移动策略与跳跃策略之间硬切换。
+
+## 可用环境
+
+| 环境 ID | 主要用途 |
+|---|---|
+| `Wheel-Legged-Flat-v0` | 平地平衡、速度跟踪、高度和航向控制 |
+| `Wheel-Legged-Jump-Flat-v0` | 基础原地跳跃与六阶段状态机 |
+| `Wheel-Legged-Jump-High-Landing-Flat-v0` | `0.09–0.12 m` 高跳、预伸腿和落地吸能 |
+| `Wheel-Legged-Jump-Clearance-Flat-v0` | 空中收腿和 `0.08–0.12 m` 轮端净空 |
+| `Wheel-Legged-Jump-Moving-Flat-v0` | 第一档低速移动跳跃 |
+| `Wheel-Legged-Jump-Moving-Curriculum-Flat-v0` | 从 `0.2 m/s` 自动训练到 `1.0 m/s` 的移动跳跃 |
+
+## 项目结构
+
+```text
+wheel_legged_robot/
+├── source/wheel_legged_robot/
+│   └── wheel_legged_robot/tasks/manager_based/wheel_legged_robot/
+│       ├── agents/                  # PPO 配置
+│       ├── assets/                  # 机器人资产配置
+│       ├── mdp/
+│       │   ├── actions.py           # VMC 动作与力矩映射
+│       │   ├── commonds.py          # 速度、高度和航向命令
+│       │   ├── curriculums.py       # 移动与移动跳跃课程
+│       │   ├── events.py            # 随机化与重置事件
+│       │   ├── jump.py              # 跳跃命令、观测和奖励
+│       │   ├── observations.py      # 观测项
+│       │   └── rewards.py           # 平衡与移动奖励
+│       ├── wheel_legged_flat_env_cfg.py
+│       └── wheel_legged_jump_env_cfg.py
+├── scripts/
+│   ├── rsl_rl/
+│   │   ├── train.py                 # RSL-RL 训练
+│   │   ├── play.py                  # 模型评估与键盘控制
+│   │   ├── train_staged.sh          # 一键分阶段训练入口
+│   │   └── staged_training_config.json
+│   ├── expand_rsl_checkpoint_for_jump.py
+│   └── jump_open_loop_test.py
+├── JUMP_OPEN_LOOP_TEST_AND_TRAINING_PLAN.md
+├── JUMP_TASK_DESIGN.md
+└── STAGED_TRAINING.md
+```
+
+## 依赖
+
+### 已验证的开发环境
+
+| 组件 | 版本 |
+|---|---|
+| 操作系统 | Linux | Ubuntu22.04
+| Python | 3.11 |
+| NVIDIA Isaac Sim | 5.1.0 |
+| Isaac Lab | 2.3.2 |
+| PyTorch | 2.7.0 + CUDA 12.8 |
+| RSL-RL | 5.0.1 |
+| Gymnasium | 1.3.0 |
+
+以上是当前开发机器上的版本记录，不代表其他版本一定不可使用。Isaac Sim、Isaac Lab、PyTorch 和 CUDA 的兼容关系变化较快，建议优先按照 [Isaac Lab 官方安装文档](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html) 创建环境。
+
+### 硬件建议
+
+- 支持 CUDA 的 NVIDIA GPU；
+- 默认训练使用 `4096` 个并行环境；
+- 显存不足时可先将 `--num_envs` 调低至 `512`、`1024` 或 `2048`；
+- Play 和功能验证通常只需要 `1–50` 个环境。
+
+### 机器人模型资产
+
+当前开发版本的机器人配置仍通过 `robot_lab.assets.ISAACLAB_ASSETS_DATA_DIR` 读取：
+
+```text
+Robots/wheelleggedrobot/wheellegged_description/urdf/wl_dealed.urdf
+```
+
+因此，公开发布前需要把相应 URDF、STL 与资源许可证整理到本仓库，或者把资产路径改为用户可配置路径。仅上传当前已跟踪文件并不能在另一台机器上完整复现，这是发布前需要优先完成的事项。
+
+## 安装
+
+### 1. 安装 Isaac Lab
+
+先按照官方文档安装 Isaac Sim 和 Isaac Lab，并确认下面的命令能够正常运行：
+
+```bash
+export ISAACLAB_ROOT=/absolute/path/to/IsaacLab
+"${ISAACLAB_ROOT}/isaaclab.sh" -p -c "import isaaclab; print('Isaac Lab is ready')"
+```
+
+如果使用 Conda，请先激活安装 Isaac Lab 的环境：
+
+```bash
+conda activate env_isaaclab
+```
+
+### 2. 克隆项目
+
+仓库正式发布后，将下面的地址替换为实际 GitHub 地址：
+
+```bash
+git clone <YOUR_GITHUB_REPOSITORY_URL>
+cd wheel_legged_robot
+```
+
+### 3. 安装扩展
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p -m pip install -e source/wheel_legged_robot
+```
+
+列出已注册环境：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/list_envs.py
+```
+
+如果可以看到以 `Wheel-Legged-` 开头的环境，说明 Python 扩展已经成功安装。
+
+## 快速开始
+
+以下命令均假设当前目录是项目根目录，并且已经设置：
+
+```bash
+export ISAACLAB_ROOT=/absolute/path/to/IsaacLab
+```
+
+### 训练平地移动策略
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Flat-v0 \
+  --headless \
+  --num_envs 4096 \
+  --run_name flat_baseline
+```
+
+训练输出保存在：
+
+```text
+logs/rsl_rl/wheel_legged_flat/<timestamp>_<run_name>/
+```
+
+### 单独训练一个跳跃阶段
+
+不同跳跃任务的观测维度一致，可以使用上一阶段 checkpoint 只迁移网络权重：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Jump-High-Landing-Flat-v0 \
+  --headless \
+  --num_envs 4096 \
+  --load_checkpoint_path /absolute/path/to/previous/model_700.pt \
+  --load_weights_only \
+  --run_name high_landing
+```
+
+不要把未经转换的平地 checkpoint 直接加载到跳跃任务。平地策略缺少跳跃观测，需要先使用 `scripts/expand_rsl_checkpoint_for_jump.py` 扩展首层网络和归一化器。
+
+### 一键完成全部阶段
+
+从平地训练开始，达到各阶段指标后自动切换任务：
+
+```bash
+./scripts/rsl_rl/train_staged.sh \
+  --isaaclab-path "${ISAACLAB_ROOT}" \
+  --num-envs 4096 \
+  --device cuda:0 \
+  --seed 42
+```
+
+如果已经有合格的平地 checkpoint，可以跳过平地训练：
+
+```bash
+./scripts/rsl_rl/train_staged.sh \
+  --isaaclab-path "${ISAACLAB_ROOT}" \
+  --flat-checkpoint /absolute/path/to/wheel_legged_flat/model_1999.pt
+```
+
+流水线使用最近一段训练指标的滑动平均决定是否晋级。如果某一阶段达到最大训练轮数仍未通过，流程会停止并保留 checkpoint，不会把未达标模型继续传给更困难的任务。
+
+详细说明见 [STAGED_TRAINING.md](STAGED_TRAINING.md)。
+
+### 查看训练结果
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Moving-Curriculum-Flat-v0 \
+  --checkpoint /absolute/path/to/model.pt \
+  --num_envs 50 \
+  --command_range 1.0 \
+  --yaw_command_range 1.2 \
+  --jump_height 0.10
+```
+
+Play 默认关闭观测噪声、地形课程、随机推力和命令课程，使用命令行给定的速度与跳跃范围进行确定性评估。
+
+### 键盘自由控制
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Moving-Curriculum-Flat-v0 \
+  --checkpoint /absolute/path/to/model.pt \
+  --keyboard \
+  --real-time \
+  --command_range 1.0 \
+  --yaw_command_range 1.2 \
+  --jump_height 0.10
+```
+
+启动后先点击一次 Isaac Sim Viewport，使窗口获得键盘焦点。
+
+| 按键 | 功能 |
+|---|---|
+| `↑ / ↓` 或数字键盘 `8 / 2` | 前进 / 后退 |
+| `Z / X` 或数字键盘 `7 / 9` | 左转 / 右转 |
+| `R / F` | 升高 / 降低机身 |
+| `J` | 触发一次跳跃 |
+| `L` | 清零移动命令并恢复默认高度 |
+
+空格键属于 Isaac Sim 的时间轴暂停快捷键，不用于跳跃。暂停并恢复后如果键盘没有响应，请确认时间轴正在播放，重新点击 Viewport，再按一次 `L` 清除残留按键状态。
+
+### 观察 TensorBoard
+
+```bash
+tensorboard --logdir logs/rsl_rl --port 6006
+```
+
+除了总奖励，建议重点观察：
+
+- 平移和航向跟踪误差；
+- `jump_takeoff_vz`、`jump_air_time`；
+- `jump_apex_rise`、`jump_wheel_clearance`；
+- `jump_success_rate`、`jump_soft_landing_rate`；
+- `jump_landing_vz`、`jump_fail_recovery_rate`；
+- `joint_margin_min`、`torque_saturation`；
+- 最终移动跳跃课程档位和各档通过指标。
+
+总奖励上升不一定意味着机器人真的学会了跳跃，应同时检查接触、滞空、轮端净空和落地恢复。
+
+## 跳跃开环测试
+
+在设计跳跃奖励前，可以先验证 VMC、关节行程、电机力矩和接触模型是否具备真实起跳能力：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/jump_open_loop_test.py \
+  --task Wheel-Legged-Flat-v0 \
+  --headless
+```
+
+脚本会并行扫描下蹲腿长、下蹲时间和蹬伸腿长，并把结果保存为 CSV 和 JSON。详细方法见 [JUMP_OPEN_LOOP_TEST_AND_TRAINING_PLAN.md](JUMP_OPEN_LOOP_TEST_AND_TRAINING_PLAN.md)。
+
+## 设计文档
+
+- [跳跃开环测试与训练路线](JUMP_OPEN_LOOP_TEST_AND_TRAINING_PLAN.md)
+- [跳跃状态机、奖励和阶段设计](JUMP_TASK_DESIGN.md)
+- [一键分阶段训练说明](STAGED_TRAINING.md)
+
+这些文档保留了项目迭代过程中出现的问题、判断依据和训练经验。部分历史数值来自特定 checkpoint，不应被理解为所有机器人和随机种子都能直接达到的保证。
+
+## 当前限制
+
+- 尚未完成真实机器人部署；
+- 尚未系统验证传感器噪声、通信延迟和执行器热衰减；
+- 目前主要在平坦地面训练，尚未加入完整障碍物感知和自主起跳时机规划；
+- 自动分阶段训练门槛来自当前机器人和已有训练日志，改变质量、尺寸、电机或奖励后需要重新校准；
+- 机器人模型资产尚未完全迁入独立仓库；
+- RSL-RL 是当前主要验证后端，CusRL 脚本仍属于实验性支持；
+- 当前结果不能替代多随机种子统计和真实硬件安全验证。
+
+## Roadmap
+
+- [ ] 整理并发布机器人 URDF、mesh 和资产许可证；
+- [ ] 补充训练与 Play 的 GIF/视频；
+- [ ] 发布可复现 checkpoint 与 TensorBoard 曲线；
+- [ ] 增加障碍物地形和目标落点命令；
+- [ ] 从外部触发跳跃扩展到感知驱动的自主越障；
+- [ ] 加入多随机种子评估和自动回归测试；
+- [ ] 完成延迟、噪声、摩擦和电机参数随机化；
+- [ ] 探索 Sim-to-Real 与真实机器人部署；
+- [ ] 补充英文 README。
+
+## 参与讨论与贡献
+
+这个项目不是一份“已经完成的标准答案”，而是一份持续更新的学习记录。作者对强化学习、控制理论和工程实现仍有许多需要学习的地方，也非常欢迎有经验的开发者指出错误。
+
+如果你在复现过程中发现问题，建议在 Issue 中附上：
+
+- Isaac Sim、Isaac Lab、Python、PyTorch 和 RSL-RL 版本；
+- 使用的任务名、命令和 checkpoint；
+- GPU 型号与 `--num_envs`；
+- 完整报错或关键训练指标；
+- 能够复现问题的最小配置。
+
+欢迎提交：
+
+- 文档修正和更清晰的解释；
+- 奖励、观测与课程学习改进；
+- 不同机器人参数上的复现实验；
+- 训练曲线、失败案例和消融实验；
+- 键盘控制、评估和部署工具；
+- 中英文翻译。
+
+无论结果成功或失败，只要过程和条件记录清楚，都可能对其他学习者有帮助。
+
+## 致谢
+
+本项目的学习与实现离不开以下优秀开源项目：
+
+- [NVIDIA Isaac Lab](https://github.com/isaac-sim/IsaacLab)：提供基于 Isaac Sim 的机器人学习框架、Manager-Based 环境、传感器、仿真和强化学习接口。
+- [clearlab-sustech/Wheel-Legged-Gym](https://github.com/clearlab-sustech/Wheel-Legged-Gym)（[BSD-3-Clause](https://github.com/clearlab-sustech/Wheel-Legged-Gym/blob/master/LICENSE)）：本项目的轮腿平衡、平移运动和 VMC 相关思路参考了该项目。感谢原作者及贡献者公开轮腿机器人训练实现。
+- [fan-ziqi/robot_lab](https://github.com/fan-ziqi/robot_lab)（[Apache-2.0](https://github.com/fan-ziqi/robot_lab/blob/main/LICENSE)）：本项目在学习 Isaac Lab Manager-Based 任务组织、环境配置和工程结构时参考了该项目。感谢作者及社区提供清晰、丰富的机器人强化学习实践。
+- [RSL-RL](https://github.com/leggedrobotics/rsl_rl)：提供本项目主要使用的 PPO 训练实现。
+
+上述项目的版权与商标归各自作者和组织所有。若本仓库中包含基于第三方代码修改的文件，应继续保留原始版权声明，并遵守相应许可证要求。
+
+## 许可证与免责声明
+
+项目的 Python 包配置目前声明为 Apache-2.0，但根目录正式许可证文件仍需在公开发布前补充并核对。第三方代码、机器人模型和资源文件可能适用各自独立的许可证，使用和再分发时请分别遵守。
+
+本项目仅供学习与研究。强化学习策略可能输出突变动作或超出预期的控制命令。部署到真实机器人前，请完成限位、力矩、速度、急停、悬挂测试和人员隔离等安全措施。作者不对直接使用本项目导致的设备损坏或人身风险承担责任。
