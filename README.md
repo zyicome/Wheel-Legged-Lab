@@ -32,11 +32,28 @@
 
 以下演示均使用最终移动跳跃策略 `model_844.pt`：
 
-| 演示 | 内容 |
-|---|---|
-| [单环境测试](docs/media/single_env_demo.mp4) | 单台机器人执行移动、转向和跳跃 |
-| [多环境测试](docs/media/multi_env_demo.mp4) | 多个并行环境中的策略表现 |
-| [键盘控制](docs/media/keyboard_control_demo.mp4) | 使用键盘实时控制移动、转向和跳跃 |
+### 单环境测试
+
+单台机器人执行移动、转向和跳跃：
+
+![单环境移动跳跃演示](docs/media/single_env_demo.gif)
+
+### 多环境测试
+
+多个并行环境中的策略表现：
+
+![多环境移动跳跃演示](docs/media/multi_env_demo.gif)
+
+### 键盘控制
+
+使用键盘实时控制移动、转向和跳跃：
+
+![键盘控制演示](docs/media/keyboard_control_demo.gif)
+
+GIF 会在 GitHub README 中直接循环播放。高清版本可单独下载：
+[单环境 MP4](docs/media/single_env_demo.mp4) ·
+[多环境 MP4](docs/media/multi_env_demo.mp4) ·
+[键盘控制 MP4](docs/media/keyboard_control_demo.mp4)
 
 预训练 checkpoint：
 
