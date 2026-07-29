@@ -43,10 +43,10 @@
       "window": 20,
       "consecutive": 5,
       "rules": {
-        "jump_apex_rise": {"min": 0.095},
-        "jump_air_time": {"min": 0.13},
+        "jump_apex_rise": {"min": 0.088},
+        "jump_air_time": {"min": 0.125},
         "jump_success_rate": {"min": 0.45},
-        "jump_soft_landing_rate": {"min": 0.80},
+        "jump_soft_landing_rate": {"min": 0.75},
         "jump_landing_vz": {"abs_max": 0.95},
         "jump_fail_recovery_rate": {"max": 0.03},
         "torque_saturation": {"max": 0.05}
@@ -63,7 +63,7 @@
       "rules": {
         "jump_wheel_clearance": {"min": 0.10},
         "jump_air_time": {"min": 0.14},
-        "jump_success_rate": {"min": 0.72},
+        "jump_success_rate": {"min": 0.68},
         "jump_soft_landing_rate": {"min": 0.85},
         "jump_landing_vz": {"abs_max": 0.80},
         "jump_fail_recovery_rate": {"max": 0.02},

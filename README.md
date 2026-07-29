@@ -28,6 +28,61 @@
 
 本项目仍是研究与学习性质的仿真工程，尚未完成真实机器人部署和系统性的 Sim-to-Real 验证。
 
+## 演示、预训练模型与训练曲线
+
+以下演示均使用最终移动跳跃策略 `model_844.pt`：
+
+| 演示 | 内容 |
+|---|---|
+| [单环境测试](docs/media/single_env_demo.mp4) | 单台机器人执行移动、转向和跳跃 |
+| [多环境测试](docs/media/multi_env_demo.mp4) | 多个并行环境中的策略表现 |
+| [键盘控制](docs/media/keyboard_control_demo.mp4) | 使用键盘实时控制移动、转向和跳跃 |
+
+预训练 checkpoint：
+
+```text
+checkpoints/wheel_legged_moving_jump_model_844.pt
+```
+
+- 对应环境：`Wheel-Legged-Jump-Moving-Curriculum-Flat-v0`
+- 课程终点：`1.0 m/s` 平移速度、`1.2 rad/s` yaw 命令范围
+- SHA-256：`d1d271f0c323fa13538b80119839b29eb267942af63a6e0d6c3dbf5ef319deb0`
+
+直接运行预训练策略：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Moving-Curriculum-Flat-v0 \
+  --checkpoint checkpoints/wheel_legged_moving_jump_model_844.pt \
+  --num_envs 1 \
+  --command_range 1.0 \
+  --yaw_command_range 1.2 \
+  --jump_height 0.10
+```
+
+最终阶段的 TensorBoard 曲线由原始 event 文件自动导出：
+
+![model_844 训练曲线](docs/media/training_curves_model_844.png)
+
+原始 TensorBoard event 已保存在 `docs/tensorboard/model_844/`，可以重新
+交互式查看：
+
+```bash
+tensorboard --logdir docs/tensorboard/model_844 --port 6006
+```
+
+如需从其他训练日志自动生成相同格式的静态图：
+
+```bash
+python scripts/plot_tensorboard_curves.py \
+  /path/to/events.out.tfevents.* \
+  --output training_curves.png \
+  --title "Wheel-Legged Training"
+```
+
+曲线和视频来自本项目当前 checkpoint 的单次训练与 Play，主要用于复现
+和展示，不代表多随机种子的统计置信区间。
+
 ## 训练路线
 
 项目没有把所有能力一次性塞进同一个奖励函数，而是逐步增加难度：
@@ -176,7 +231,7 @@ cd Wheel-Legged-Lab
 以下命令均假设当前目录是项目根目录，并且已经设置：
 
 ```bash
-export ISAACLAB_ROOT=/absolute/path/to/IsaacLab
+export ISAACLAB_ROOT="/absolute/path/to/IsaacLab"
 ```
 
 ### 训练平地移动策略
@@ -228,8 +283,51 @@ logs/rsl_rl/wheel_legged_flat/<timestamp>_<run_name>/
 ```bash
 ./scripts/rsl_rl/train_staged.sh \
   --isaaclab-path "${ISAACLAB_ROOT}" \
-  --flat-checkpoint /absolute/path/to/wheel_legged_flat/model_1999.pt
+  --start-checkpoint /absolute/path/to/wheel_legged_flat/model_1999.pt \
+  --start-stage flat \
+  --start-mode next
 ```
+
+也可以从任意中间阶段恢复。三个参数必须一起提供：
+
+| 参数 | 含义 |
+|---|---|
+| `--start-checkpoint` | 用作恢复或迁移起点的模型文件 |
+| `--start-stage` | 该模型所属阶段，而不是准备进入的阶段 |
+| `--start-mode continue` | 恢复当前阶段的网络、优化器和 iteration；达标后再自动切换 |
+| `--start-mode next` | 确认当前阶段已经合格，跳过其验收并将网络权重迁移至下一阶段 |
+
+可用的阶段名称依次为：
+
+```text
+flat → jump_flat → high_landing → clearance → moving_curriculum
+```
+
+例如，继续训练一个尚未完全达标的 High-Landing 模型：
+
+```bash
+./scripts/rsl_rl/train_staged.sh \
+  --isaaclab-path "${ISAACLAB_ROOT}" \
+  --start-checkpoint \
+  /absolute/path/to/wheel_legged_jump_high_landing_flat/model_800.pt \
+  --start-stage high_landing \
+  --start-mode continue
+```
+
+如果已经确认这个 High-Landing 模型合格，直接进入 Clearance：
+
+```bash
+./scripts/rsl_rl/train_staged.sh \
+  --isaaclab-path "${ISAACLAB_ROOT}" \
+  --start-checkpoint \
+  /absolute/path/to/wheel_legged_jump_high_landing_flat/model_800.pt \
+  --start-stage high_landing \
+  --start-mode next
+```
+
+最终阶段 `moving_curriculum` 后面没有其他阶段，因此只能选择
+`--start-mode continue`。旧参数 `--flat-checkpoint PATH` 仍然兼容，
+等价于以 `flat + next` 模式启动。
 
 流水线使用最近一段训练指标的滑动平均决定是否晋级。如果某一阶段达到最大训练轮数仍未通过，流程会停止并保留 checkpoint，不会把未达标模型继续传给更困难的任务。
 
@@ -326,8 +424,8 @@ tensorboard --logdir logs/rsl_rl --port 6006
 
 - [x] 将机器人 URDF 与 mesh 迁入项目并改为包内路径；
 - [x] 补充 Wheel-Legged-Gym 模型来源、修改记录与 BSD 3-Clause 许可证；
-- [ ] 补充训练与 Play 的 GIF/视频；
-- [ ] 发布可复现 checkpoint 与 TensorBoard 曲线；
+- [x] 补充训练与 Play 的 GIF/视频；
+- [x] 发布可复现 checkpoint 与 TensorBoard 曲线；
 - [ ] 增加障碍物地形和目标落点命令；
 - [ ] 从外部触发跳跃扩展到感知驱动的自主越障；
 - [ ] 加入多随机种子评估和自动回归测试；

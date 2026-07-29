@@ -143,7 +143,14 @@ class WheelLeggedCommand(CommandTerm):
                 self._goal_height_vis.set_visibility(False)
 
     def _debug_vis_callback(self, event):
-        asset = self._env.scene[self.cfg.asset_name]
+        # CommandManager may deliver one final render event while the
+        # environment is being torn down. At that point DirectRLEnv has
+        # already deleted ``scene`` and the visualization must become a no-op.
+        try:
+            scene = self._env.scene
+        except (AttributeError, ReferenceError):
+            return
+        asset = scene[self.cfg.asset_name]
         if not asset.is_initialized:
             return
 

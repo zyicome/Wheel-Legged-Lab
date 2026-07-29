@@ -47,15 +47,70 @@ cd Wheel-Legged-Lab
 
 ```bash
 ./scripts/rsl_rl/train_staged.sh \
-  --flat-checkpoint \
-  logs/rsl_rl/wheel_legged_flat/<run>/model_<iteration>.pt
+  --start-checkpoint logs/rsl_rl/wheel_legged_flat/<run>/model_<iteration>.pt \
+  --start-stage flat \
+  --start-mode next
 ```
 
 流水线会自动调用 `expand_rsl_checkpoint_for_jump.py` 扩展 Actor、Critic
 和观测归一化器，并限制继承的探索标准差。不要直接把未转换的平地
 checkpoint 加载到跳跃任务。
 
-## 4. 自动晋级原理
+原来的 `--flat-checkpoint PATH` 仍然可用，等价于以上三个参数。
+
+## 4. 从任意阶段继续或进入下一阶段
+
+通用恢复入口由三个参数共同组成：
+
+- `--start-checkpoint`：模型文件；
+- `--start-stage`：这个模型所属的阶段；
+- `--start-mode continue|next`：继续本阶段，或直接进入下一阶段。
+
+可用阶段名称依次为：
+
+```text
+flat
+jump_flat
+high_landing
+clearance
+moving_curriculum
+```
+
+例如，已有一个表现较好的 `high_landing` 模型，希望继续强化当前阶段，
+达到门槛后再自动进入 `clearance`：
+
+```bash
+./scripts/rsl_rl/train_staged.sh \
+  --start-checkpoint \
+  logs/rsl_rl/wheel_legged_jump_high_landing_flat/<run>/model_<iteration>.pt \
+  --start-stage high_landing \
+  --start-mode continue
+```
+
+`continue` 会恢复 Actor、Critic、优化器和 iteration，且仍然执行当前
+阶段的自动验收；只有当前阶段达标后才进入后续阶段。它要求 checkpoint
+与所选阶段的任务、网络和观测维度一致。
+
+如果该模型已经通过 `high_landing` 的人工检查，希望跳过验收并直接训练
+`clearance`：
+
+```bash
+./scripts/rsl_rl/train_staged.sh \
+  --start-checkpoint \
+  logs/rsl_rl/wheel_legged_jump_high_landing_flat/<run>/model_<iteration>.pt \
+  --start-stage high_landing \
+  --start-mode next
+```
+
+`next` 会把 Actor/Critic 权重迁移至下一阶段，但使用新的优化器并从新的
+iteration 计数开始。选择 `next` 表示你已经确认来源阶段合格，流水线不会
+再次检查该阶段。最终阶段 `moving_curriculum` 后面没有阶段，因此它只能
+使用 `continue`。
+
+三个参数必须同时提供，防止 checkpoint 所属阶段不明确。示例中的
+`--start-stage` 指的是“模型来自哪个阶段”，而不是将要进入的阶段。
+
+## 5. 自动晋级原理
 
 每个阶段使用最近 `20` 个 iteration 的训练指标平均值，并要求连续
 `5` 次判断全部通过。还设置了最低训练轮数，防止迁移初期的偶然高值
@@ -83,7 +138,7 @@ C1 训练日志中的 `jump_success_rate` 可能只有约 `0.49`，但对应的
 高度、落速、柔落和恢复指标共同通过。不要仅把该数值单独理解为最终
 成功率要求。
 
-## 5. Checkpoint 如何迁移
+## 6. Checkpoint 如何迁移
 
 - Flat → Jump Flat：先扩展输入维度，再只加载 Actor/Critic 权重。
 - 后续阶段：观测和动作维度相同，直接只加载 Actor/Critic 权重。
@@ -93,7 +148,7 @@ C1 训练日志中的 `jump_success_rate` 可能只有约 `0.49`，但对应的
 `--load_weights_only` 是有意设置的。不同阶段奖励分布发生变化，沿用上一
 阶段的 Adam 动量容易在新阶段产生过大的早期更新。
 
-## 6. 日志与失败保护
+## 7. 日志与失败保护
 
 每次运行会建立：
 
@@ -115,7 +170,7 @@ logs/rsl_rl/staged_pipeline/<timestamp>/
 同时保留该阶段最终 checkpoint 和状态文件。这样不会把尚未掌握当前
 能力的模型自动传到更困难的任务。
 
-## 7. 调整原则
+## 8. 调整原则
 
 优先调整每阶段的 `max_iterations`，不要为了让流水线“通过”就明显降低
 所有门槛。只有在多次训练都稳定卡在同一指标、并且确定性 Play 已经证实

@@ -73,6 +73,12 @@ def main() -> None:
         raise ValueError("Output must differ from input; the original checkpoint is never overwritten.")
 
     checkpoint = torch.load(input_path, map_location="cpu", weights_only=False)
+    previous_conversion = (checkpoint.get("infos") or {}).get("jump_checkpoint_conversion")
+    if previous_conversion is not None:
+        raise ValueError(
+            "Input checkpoint was already expanded for jump observations: "
+            f"{previous_conversion}. Use it directly with --load_weights_only."
+        )
     for key in ("actor_state_dict", "critic_state_dict"):
         if key not in checkpoint:
             raise KeyError(f"Checkpoint has no {key!r}; expected an RSL-RL 3 checkpoint.")

@@ -236,7 +236,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
     command_term = env.unwrapped.command_manager._terms.get("wheel_legged_commands")
-    if command_term is not None and not args_cli.keyboard:
+    # Debug markers are useful in an interactive viewport, but headless
+    # recording has no viewport and may emit callbacks during environment
+    # teardown after ``scene`` has already been released.
+    if command_term is not None and not args_cli.keyboard and not args_cli.headless:
         command_term.set_debug_vis(True)
 
     # convert to single-agent instance if required by the RL algorithm

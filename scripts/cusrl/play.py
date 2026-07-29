@@ -180,7 +180,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # 非键盘模式启用 command debug 可视化。
     cmd_term = env.unwrapped.command_manager._terms.get("wheel_legged_commands")
-    if cmd_term is not None and not args_cli.keyboard:
+    if cmd_term is not None and not args_cli.keyboard and not args_cli.headless:
         cmd_term.set_debug_vis(True)
 
     # convert to single-agent instance if required by the RL algorithm
