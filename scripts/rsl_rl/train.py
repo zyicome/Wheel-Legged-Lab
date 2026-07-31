@@ -148,6 +148,51 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_de
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
+
+
+def _expand_observation_checkpoint(checkpoint_path: str, runner, output_dir: str) -> str:
+    """Pad actor/critic observation tensors while preserving all learned columns."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    groups = (
+        ("actor_state_dict", runner.alg.actor.state_dict()),
+        ("critic_state_dict", runner.alg.critic.state_dict()),
+    )
+    changed = False
+    for group_name, target_state in groups:
+        source_state = checkpoint.get(group_name)
+        if source_state is None:
+            continue
+        for key, target in target_state.items():
+            source = source_state.get(key)
+            if source is None or not torch.is_tensor(source) or source.shape == target.shape:
+                continue
+            # Observation expansion changes only vector length or the input
+            # dimension of the first MLP layer. Other mismatches remain errors.
+            compatible = (
+                source.ndim == target.ndim
+                and source.ndim in (1, 2)
+                and all(
+                    source.shape[dim] == target.shape[dim]
+                    for dim in range(source.ndim - 1)
+                )
+                and source.shape[-1] < target.shape[-1]
+            )
+            if not compatible:
+                continue
+            expanded = target.detach().cpu().clone()
+            expanded[..., : source.shape[-1]] = source.detach().cpu()
+            source_state[key] = expanded
+            changed = True
+            print(
+                f"[INFO] Expanded {group_name}.{key}: "
+                f"{tuple(source.shape)} -> {tuple(target.shape)}"
+            )
+    if not changed:
+        return checkpoint_path
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "expanded_observation_checkpoint.pt")
+    torch.save(checkpoint, output_path)
+    return output_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # import logger
@@ -389,6 +434,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         if args_cli.load_weights_only:
+            resume_path = _expand_observation_checkpoint(
+                resume_path, runner, log_dir
+            )
             runner.load(
                 resume_path,
                 load_cfg={

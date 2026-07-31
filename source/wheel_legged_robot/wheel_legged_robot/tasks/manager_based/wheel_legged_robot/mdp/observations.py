@@ -69,6 +69,24 @@ def wheel_legged_commands(
     scale_tensor = torch.tensor(scale, device=env.device)
     return commands * scale_tensor
 
+
+def obstacle_forward_scan(
+    env: ManagerBasedRLEnv,
+    distances: tuple[float, ...] = (0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00),
+) -> torch.Tensor:
+    """Robot-yaw-aligned forward height scan of the active obstacle geometry."""
+    count = len(distances)
+    if not hasattr(env, "obstacle_position_w"):
+        return torch.zeros(env.num_envs, count, device=env.device)
+    samples = torch.tensor(distances, device=env.device).unsqueeze(0)
+    root_delta = env._robot.data.root_pos_w[:, :2] - env.obstacle_position_w
+    obstacle_from_root = -torch.sum(
+        root_delta * env.obstacle_forward_w, dim=1, keepdim=True
+    )
+    half_width = 0.5 * env.obstacle_width.unsqueeze(1)
+    hit = (samples - obstacle_from_root).abs() <= half_width
+    return torch.where(hit, env.obstacle_height.unsqueeze(1), 0.0)
+
 def base_mass(env) -> torch.Tensor:
     """返回基座质量减去所有环境均值，形状 (num_envs, 1)"""
     if hasattr(env, "_base_mass"):

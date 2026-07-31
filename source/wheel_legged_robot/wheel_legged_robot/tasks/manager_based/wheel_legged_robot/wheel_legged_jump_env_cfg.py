@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import torch
 
+import isaaclab.sim as sim_utils
+from isaaclab.assets import RigidObjectCfg
+from isaaclab.sim.views import XformPrimView
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -17,6 +20,8 @@ from isaaclab.managers import (
     TerminationTermCfg,
 )
 from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_apply, quat_from_euler_xyz
+from isaaclab.sensors import ContactSensorCfg
 
 from . import mdp
 from .wheel_legged_flat_env_cfg import (
@@ -75,6 +80,9 @@ class JumpStateMachineCfg:
     success_wheel_clearance_ratio: float = 0.0
     success_min_air_time: float = 0.12
     success_max_recovery_vx_error: float = float("inf")
+    # Optional target-landing acceptance. ``inf`` preserves every existing
+    # jump task; the target-landing stage installs a finite planar tolerance.
+    success_max_landing_position_error: float = float("inf")
     use_leg_reference_assist: bool = True
     # The Stage-B1 actor learned residuals around the former shallow reference.
     # Limit its authority during the B2 transfer so it cannot cancel the proven
@@ -118,6 +126,74 @@ class JumpStateMachineCfg:
     soft_landing_speed: float = 0.80
 
 
+@configclass
+class ObstacleOracleCfg:
+    """Geometry and analytic trigger parameters for the first obstacle stage."""
+
+    spawn_distance: float = 0.90
+    obstacle_width: float = 0.035
+    obstacle_width_levels: tuple[float, ...] = (0.035, 0.050, 0.065, 0.080)
+    obstacle_lateral_size: float = 1.00
+    obstacle_max_height: float = 0.08
+    obstacle_height_range: tuple[float, float] = (0.02, 0.04)
+    preparation_time: float = 0.44
+    takeoff_margin: float = 0.03
+    landing_margin: float = 0.04
+    minimum_clearance: float = 0.015
+    wheel_radius: float = 0.0675
+    contact_force_threshold: float = 2.0
+
+
+def _obstacle_body_contact_sensor(body_name: str) -> ContactSensorCfg:
+    """Create a valid one-body-to-one-obstacle filtered contact sensor."""
+    return ContactSensorCfg(
+        prim_path=f"{{ENV_REGEX_NS}}/Robot/{body_name}",
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obstacle"],
+        history_length=1,
+        track_air_time=False,
+    )
+
+
+@configclass
+class WheelLeggedObstacleSceneCfg(WheelLeggedRobotSceneCfg):
+    """Flat scene with one kinematic barrier cloned into every environment."""
+
+    obstacle = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Obstacle",
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(0.90, 0.0, 0.04), rot=(1.0, 0.0, 0.0, 0.0)
+        ),
+        spawn=sim_utils.CuboidCfg(
+            size=(0.035, 1.00, 0.08),
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.85, 0.20, 0.08),
+                metallic=0.0,
+                roughness=0.7,
+            ),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=0.8,
+                dynamic_friction=0.7,
+                restitution=0.0,
+            ),
+        ),
+    )
+    # Contact filtering is one-to-many only in Isaac Lab. Use one sensor per
+    # robot body instead of a Robot/.* expression.
+    obstacle_contact_base = _obstacle_body_contact_sensor("base_link")
+    obstacle_contact_lf0 = _obstacle_body_contact_sensor("lf0_Link")
+    obstacle_contact_lf1 = _obstacle_body_contact_sensor("lf1_Link")
+    obstacle_contact_rf0 = _obstacle_body_contact_sensor("rf0_Link")
+    obstacle_contact_rf1 = _obstacle_body_contact_sensor("rf1_Link")
+    obstacle_contact_lwheel = _obstacle_body_contact_sensor("l_wheel_Link")
+    obstacle_contact_rwheel = _obstacle_body_contact_sensor("r_wheel_Link")
+
+
 class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
     """Wheel-legged environment with a six-state, contact-driven jump machine."""
 
@@ -145,6 +221,13 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
         self.jump_landing_vz = torch.zeros(self.num_envs, device=self.device)
         self.jump_landing_vx = torch.zeros(self.num_envs, device=self.device)
         self.jump_landing_leg_length = torch.zeros(self.num_envs, device=self.device)
+        self.jump_takeoff_position_w = self._robot.data.root_pos_w[:, :2].clone()
+        self.jump_target_position_w = self.jump_takeoff_position_w.clone()
+        self.jump_landing_position_w = self.jump_takeoff_position_w.clone()
+        self.jump_landing_position_error = torch.zeros(self.num_envs, device=self.device)
+        self._jump_landing_position_valid = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.jump_takeoff_event = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.jump_landing_event = torch.zeros_like(self.jump_takeoff_event)
         self.jump_success_event = torch.zeros_like(self.jump_takeoff_event)
@@ -157,6 +240,13 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
         self._jump_attempts = torch.zeros(self.num_envs, device=self.device)
         self._jump_successes = torch.zeros(self.num_envs, device=self.device)
         self._jump_soft_landings = torch.zeros(self.num_envs, device=self.device)
+        self._jump_target_landings = torch.zeros(self.num_envs, device=self.device)
+        self._jump_landing_position_error_sum = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self._jump_landing_position_count = torch.zeros(
+            self.num_envs, device=self.device
+        )
         self._jump_fail_crouch = torch.zeros(self.num_envs, device=self.device)
         self._jump_fail_thrust = torch.zeros(self.num_envs, device=self.device)
         self._jump_fail_unload = torch.zeros(self.num_envs, device=self.device)
@@ -250,6 +340,8 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
             self.jump_takeoff_vx[start] = 0.0
             self.jump_landing_vz[start] = 0.0
             self.jump_landing_vx[start] = 0.0
+            self.jump_landing_position_error[start] = 0.0
+            self._jump_landing_position_valid[start] = False
             self._jump_airborne_steps[start] = 0
             self._jump_airborne_ever[start] = False
             self._jump_attempts[start] += 1.0
@@ -289,6 +381,19 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
         if takeoff.any():
             self.jump_takeoff_vz[takeoff] = root_vz[takeoff]
             self.jump_takeoff_vx[takeoff] = root_vx[takeoff]
+            self.jump_takeoff_position_w[takeoff] = self._robot.data.root_pos_w[
+                takeoff, :2
+            ]
+            forward_b = torch.zeros(self.num_envs, 3, device=self.device)
+            forward_b[:, 0] = 1.0
+            forward_w = quat_apply(self._robot.data.root_quat_w, forward_b)
+            forward_xy = torch.nn.functional.normalize(
+                forward_w[:, :2], dim=1, eps=1.0e-6
+            )
+            self.jump_target_position_w[takeoff] = (
+                self.jump_takeoff_position_w[takeoff]
+                + forward_xy[takeoff] * jump_command[takeoff, 2].unsqueeze(-1)
+            )
             self.jump_takeoff_event[takeoff] = True
             self._jump_airborne_ever[takeoff] = True
 
@@ -325,6 +430,7 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
             self.jump_landing_vz[first_touchdown] = root_vz[first_touchdown]
             self.jump_landing_vx[first_touchdown] = root_vx[first_touchdown]
             self.jump_landing_leg_length[first_touchdown] = mean_leg_length[first_touchdown]
+            self._record_jump_landing_position(first_touchdown)
 
         flight = self.jump_phase == mdp.JUMP_PHASE_FLIGHT
         landing = (
@@ -340,6 +446,8 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
                 self.jump_landing_vz[landing] = root_vz[landing]
                 self.jump_landing_vx[landing] = root_vx[landing]
                 self.jump_landing_leg_length[landing] = mean_leg_length[landing]
+            missing_position = landing & ~self._jump_landing_position_valid
+            self._record_jump_landing_position(missing_position)
             self.jump_landing_event[landing] = True
             landing_speed_for_metric = (
                 self.jump_landing_vz[landing]
@@ -348,6 +456,10 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
             )
             self._jump_soft_landings[landing] += (
                 landing_speed_for_metric.abs() <= cfg.soft_landing_speed
+            ).float()
+            self._jump_target_landings[landing] += (
+                self.jump_landing_position_error[landing]
+                <= cfg.success_max_landing_position_error
             ).float()
             self._enter_jump_phase(landing, mdp.JUMP_PHASE_LANDING)
 
@@ -378,6 +490,11 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
             >= cfg.success_wheel_clearance_ratio * jump_command[:, 1]
         )
         air_time_reached = self._jump_airborne_steps * self.step_dt >= cfg.success_min_air_time
+        obstacle_success_ready = getattr(
+            self,
+            "jump_obstacle_success_ready",
+            torch.ones(self.num_envs, dtype=torch.bool, device=self.device),
+        )
         successful = (
             recovered
             & self._jump_airborne_ever
@@ -385,6 +502,11 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
             & clearance_reached
             & air_time_reached
             & (self.jump_landing_vz.abs() <= cfg.success_max_landing_speed)
+            & (
+                self.jump_landing_position_error
+                <= cfg.success_max_landing_position_error
+            )
+            & obstacle_success_ready
             & (
                 (root_vx - self.jump_target_vx).abs()
                 <= cfg.success_max_recovery_vx_error
@@ -408,6 +530,20 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
             self._jump_fail_recovery[recovery_failed] += 1.0
             self._enter_jump_phase(recovery_failed, mdp.JUMP_PHASE_IDLE)
 
+    def _record_jump_landing_position(self, mask: torch.Tensor):
+        """Latch first-touchdown position and its planar target error."""
+        if not mask.any():
+            return
+        position = self._robot.data.root_pos_w[mask, :2]
+        error = torch.linalg.vector_norm(
+            position - self.jump_target_position_w[mask], dim=1
+        )
+        self.jump_landing_position_w[mask] = position
+        self.jump_landing_position_error[mask] = error
+        self._jump_landing_position_valid[mask] = True
+        self._jump_landing_position_error_sum[mask] += error
+        self._jump_landing_position_count[mask] += 1.0
+
     def _log_debug_metrics(self):
         super()._log_debug_metrics()
         if not hasattr(self, "jump_phase"):
@@ -427,6 +563,9 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
         enabled = command[:, 1] > 0.0
         log["jump_target_height"] = (
             command[enabled, 1].mean().item() if enabled.any() else 0.0
+        )
+        log["jump_target_distance"] = (
+            command[enabled, 2].mean().item() if enabled.any() else 0.0
         )
         valid_takeoff = self._jump_airborne_ever
         valid_landing = self.jump_landing_vz < 0.0
@@ -483,6 +622,13 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
         log["jump_soft_landing_rate"] = (
             self._jump_soft_landings.sum() / attempts
         ).item()
+        landing_count = self._jump_landing_position_count.sum().clamp_min(1.0)
+        log["jump_landing_position_error"] = (
+            self._jump_landing_position_error_sum.sum() / landing_count
+        ).item()
+        log["jump_target_landing_rate"] = (
+            self._jump_target_landings.sum() / attempts
+        ).item()
         log["jump_fail_crouch_rate"] = (self._jump_fail_crouch.sum() / attempts).item()
         log["jump_fail_thrust_rate"] = (self._jump_fail_thrust.sum() / attempts).item()
         log["jump_fail_unload_rate"] = (self._jump_fail_unload.sum() / attempts).item()
@@ -536,6 +682,12 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
         self.jump_landing_vz[env_ids] = 0.0
         self.jump_landing_vx[env_ids] = 0.0
         self.jump_landing_leg_length[env_ids] = 0.0
+        root_xy = self._robot.data.root_pos_w[env_ids, :2]
+        self.jump_takeoff_position_w[env_ids] = root_xy
+        self.jump_target_position_w[env_ids] = root_xy
+        self.jump_landing_position_w[env_ids] = root_xy
+        self.jump_landing_position_error[env_ids] = 0.0
+        self._jump_landing_position_valid[env_ids] = False
         self.jump_takeoff_event[env_ids] = False
         self.jump_landing_event[env_ids] = False
         self.jump_success_event[env_ids] = False
@@ -548,11 +700,364 @@ class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
         self._jump_attempts[env_ids] = 0.0
         self._jump_successes[env_ids] = 0.0
         self._jump_soft_landings[env_ids] = 0.0
+        self._jump_target_landings[env_ids] = 0.0
+        self._jump_landing_position_error_sum[env_ids] = 0.0
+        self._jump_landing_position_count[env_ids] = 0.0
         self._jump_fail_crouch[env_ids] = 0.0
         self._jump_fail_thrust[env_ids] = 0.0
         self._jump_fail_unload[env_ids] = 0.0
         self._jump_fail_performance[env_ids] = 0.0
         self._jump_fail_recovery[env_ids] = 0.0
+
+
+class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
+    """Jump environment with an exact-geometry obstacle trigger."""
+
+    def __init__(self, cfg, **kwargs):
+        super().__init__(cfg, **kwargs)
+        self._obstacle = self.scene["obstacle"]
+        self._obstacle_xform = XformPrimView(
+            "/World/envs/env_.*/Obstacle",
+            device=self.device,
+            sync_usd_on_fabric_write=True,
+        )
+        self._obstacle_contact_sensors = tuple(
+            self.scene.sensors[name]
+            for name in (
+                "obstacle_contact_base",
+                "obstacle_contact_lf0",
+                "obstacle_contact_lf1",
+                "obstacle_contact_rf0",
+                "obstacle_contact_rf1",
+                "obstacle_contact_lwheel",
+                "obstacle_contact_rwheel",
+            )
+        )
+        self.obstacle_height = torch.zeros(self.num_envs, device=self.device)
+        self.obstacle_width = torch.full(
+            (self.num_envs,), self.cfg.obstacle_oracle.obstacle_width, device=self.device
+        )
+        self.obstacle_position_w = torch.zeros(self.num_envs, 2, device=self.device)
+        self.obstacle_forward_w = torch.zeros(self.num_envs, 2, device=self.device)
+        self.obstacle_forward_w[:, 0] = 1.0
+        self.obstacle_min_clearance = torch.full(
+            (self.num_envs,), float("inf"), device=self.device
+        )
+        self.obstacle_trigger_error = torch.zeros(self.num_envs, device=self.device)
+        self.obstacle_trigger_event = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.obstacle_cross_event = torch.zeros_like(self.obstacle_trigger_event)
+        self.obstacle_collision_event = torch.zeros_like(self.obstacle_trigger_event)
+        self.obstacle_trial_triggered = torch.zeros_like(self.obstacle_trigger_event)
+        self.obstacle_trial_crossed = torch.zeros_like(self.obstacle_trigger_event)
+        self.obstacle_trial_collision = torch.zeros_like(self.obstacle_trigger_event)
+        self.obstacle_respawn_pending = torch.zeros_like(self.obstacle_trigger_event)
+        self.jump_obstacle_success_ready = torch.zeros_like(
+            self.obstacle_trigger_event
+        )
+        self._obstacle_trials = torch.zeros(self.num_envs, device=self.device)
+        self._obstacle_clears = torch.zeros(self.num_envs, device=self.device)
+        self._obstacle_collisions = torch.zeros(self.num_envs, device=self.device)
+        self._obstacle_successes = torch.zeros(self.num_envs, device=self.device)
+        self._obstacle_collision_force_sum = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self._obstacle_collision_force_peak = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        # base, lf0, lf1, rf0, rf1, left wheel, right wheel
+        self._obstacle_collision_body_counts = torch.zeros(
+            self.num_envs, 7, device=self.device
+        )
+        self._place_obstacle(torch.arange(self.num_envs, device=self.device))
+
+    def _place_obstacle(self, env_ids: torch.Tensor):
+        if len(env_ids) == 0:
+            return
+        cfg = self.cfg.obstacle_oracle
+        root_pos = self._robot.data.root_pos_w[env_ids]
+        forward_b = torch.zeros(len(env_ids), 3, device=self.device)
+        forward_b[:, 0] = 1.0
+        forward_w = quat_apply(self._robot.data.root_quat_w[env_ids], forward_b)
+        yaw = torch.atan2(forward_w[:, 1], forward_w[:, 0])
+        forward_xy = torch.stack((torch.cos(yaw), torch.sin(yaw)), dim=1)
+        level = int(getattr(self, "_obstacle_curriculum_level", 0))
+        height_levels = getattr(
+            self, "_obstacle_height_levels", (cfg.obstacle_height_range[1],)
+        )
+        level = min(level, len(height_levels) - 1)
+        height_top = float(height_levels[level])
+        height_low = max(0.02, height_top - 0.01)
+        height = torch.empty(len(env_ids), device=self.device).uniform_(
+            height_low, height_top
+        )
+        width = float(
+            getattr(self, "_obstacle_width_levels", cfg.obstacle_width_levels)[level]
+        )
+        scales = torch.ones((len(env_ids), 3), device=self.device)
+        scales[:, 0] = width / cfg.obstacle_width
+        self._obstacle_xform.set_scales(scales, indices=env_ids)
+        position_xy = root_pos[:, :2] + cfg.spawn_distance * forward_xy
+        # The cuboid keeps a fixed collision shape. Lowering most of it below
+        # the plane provides per-environment exposed-height randomization.
+        position_z = height - 0.5 * cfg.obstacle_max_height
+        pose = torch.cat(
+            (
+                position_xy,
+                position_z.unsqueeze(-1),
+                quat_from_euler_xyz(
+                    torch.zeros_like(yaw), torch.zeros_like(yaw), yaw
+                ),
+            ),
+            dim=1,
+        )
+        self._obstacle.write_root_pose_to_sim(pose, env_ids=env_ids)
+        self.obstacle_height[env_ids] = height
+        self.obstacle_width[env_ids] = width
+        self.obstacle_position_w[env_ids] = position_xy
+        self.obstacle_forward_w[env_ids] = forward_xy
+        self.obstacle_min_clearance[env_ids] = float("inf")
+        self.obstacle_trigger_error[env_ids] = 0.0
+        self.obstacle_trial_triggered[env_ids] = False
+        self.obstacle_trial_crossed[env_ids] = False
+        self.obstacle_trial_collision[env_ids] = False
+        self.obstacle_respawn_pending[env_ids] = False
+        self.jump_obstacle_success_ready[env_ids] = False
+
+    def _pre_reward_update(self):
+        cfg = self.cfg.obstacle_oracle
+        self.obstacle_trigger_event.zero_()
+        self.obstacle_cross_event.zero_()
+        self.obstacle_collision_event.zero_()
+
+        respawn_ids = self.obstacle_respawn_pending.nonzero(
+            as_tuple=False
+        ).squeeze(-1)
+        self._place_obstacle(respawn_ids)
+
+        root_xy = self._robot.data.root_pos_w[:, :2]
+        root_delta = root_xy - self.obstacle_position_w
+        root_longitudinal = torch.sum(root_delta * self.obstacle_forward_w, dim=1)
+        near_distance = -0.5 * self.obstacle_width - root_longitudinal
+        velocity_command = self.command_manager.get_command(
+            "wheel_legged_commands"
+        )
+
+        body_contact_forces = []
+        for sensor in self._obstacle_contact_sensors:
+            force_matrix = sensor.data.force_matrix_w
+            if force_matrix is None:
+                raise RuntimeError(
+                    "Obstacle contact sensor filter was not initialized."
+                )
+            body_force = torch.linalg.vector_norm(force_matrix, dim=-1)
+            while body_force.ndim > 1:
+                body_force = body_force.amax(dim=-1)
+            body_contact_forces.append(body_force)
+        body_contact_forces = torch.stack(body_contact_forces, dim=1)
+        contact_force, collision_body = body_contact_forces.max(dim=1)
+        collision = contact_force > cfg.contact_force_threshold
+        new_collision = (
+            self.obstacle_trial_triggered
+            & collision
+            & ~self.obstacle_trial_collision
+        )
+        self.obstacle_collision_event[new_collision] = True
+        self.obstacle_trial_collision |= collision & self.obstacle_trial_triggered
+        self._obstacle_collisions[new_collision] += 1.0
+        if new_collision.any():
+            self._obstacle_collision_force_sum[new_collision] += contact_force[
+                new_collision
+            ]
+            self._obstacle_collision_force_peak[new_collision] = torch.maximum(
+                self._obstacle_collision_force_peak[new_collision],
+                contact_force[new_collision],
+            )
+            event_env_ids = new_collision.nonzero(as_tuple=False).squeeze(-1)
+            self._obstacle_collision_body_counts[
+                event_env_ids, collision_body[event_env_ids]
+            ] += 1.0
+
+        wheel_xy = self._robot.data.body_pos_w[
+            :, self._jump_robot_wheel_body_ids, :2
+        ]
+        wheel_delta = wheel_xy - self.obstacle_position_w.unsqueeze(1)
+        wheel_longitudinal = torch.sum(
+            wheel_delta * self.obstacle_forward_w.unsqueeze(1), dim=2
+        )
+        # Add two control-step travel margins so a narrow barrier cannot fall
+        # entirely between sampled wheel positions at higher approach speeds.
+        sampling_margin = (
+            velocity_command[:, 0].abs() * (2.0 * self.step_dt)
+        ).unsqueeze(1)
+        wheel_over = (
+            wheel_longitudinal.abs()
+            <= 0.5 * self.obstacle_width.unsqueeze(1) + sampling_margin
+        )
+        both_over = wheel_over.all(dim=1)
+        wheel_far_passed = (
+            wheel_longitudinal.amin(dim=1) >= 0.5 * self.obstacle_width
+        )
+        wheel_bottom = (
+            self._robot.data.body_pos_w[
+                :, self._jump_robot_wheel_body_ids, 2
+            ].amin(dim=1)
+            - cfg.wheel_radius
+        )
+        clearance = wheel_bottom - self.obstacle_height
+        self.obstacle_min_clearance = torch.where(
+            both_over,
+            torch.minimum(self.obstacle_min_clearance, clearance),
+            self.obstacle_min_clearance,
+        )
+
+        crossed = (
+            self.obstacle_trial_triggered
+            & wheel_far_passed
+            & ~self.obstacle_trial_crossed
+        )
+        self.obstacle_cross_event[crossed] = True
+        self.obstacle_trial_crossed |= crossed
+        clean_cross = crossed & ~self.obstacle_trial_collision
+        self._obstacle_clears[clean_cross] += 1.0
+
+        jump_command = self.command_manager.get_command("jump_command")
+        target_height = torch.maximum(
+            self.obstacle_height + cfg.minimum_clearance + 0.025,
+            torch.full_like(self.obstacle_height, 0.08),
+        )
+        # This value is latched by the jump state machine at confirmed
+        # takeoff. Aim beyond the actual far edge from the *current* root
+        # position instead of requesting the former fixed 10.5 cm hop.
+        target_distance = torch.clamp(
+            near_distance + self.obstacle_width + cfg.landing_margin,
+            min=0.10,
+            max=0.30,
+        )
+        jump_command[:, 1] = target_height
+        jump_command[:, 2] = target_distance
+
+        idle = self.jump_phase == mdp.JUMP_PHASE_IDLE
+        trigger_distance = (
+            velocity_command[:, 0].abs() * cfg.preparation_time
+            + cfg.takeoff_margin
+            # ``near_distance`` is measured from the robot root. Add half a
+            # wheel radius as anticipation; a full radius moved takeoff so far
+            # forward that the former short-hop policy landed before the edge.
+            + 0.5 * cfg.wheel_radius
+        )
+        trigger = (
+            idle
+            & ~self.obstacle_trial_triggered
+            & (near_distance > 0.0)
+            & (near_distance <= trigger_distance)
+        )
+        jump_command[:, 0] = trigger.float()
+        if trigger.any():
+            self.obstacle_trigger_event[trigger] = True
+            self.obstacle_trial_triggered[trigger] = True
+            self.obstacle_trigger_error[trigger] = (
+                near_distance[trigger] - trigger_distance[trigger]
+            )
+            self._obstacle_trials[trigger] += 1.0
+
+        finite_clearance = torch.isfinite(self.obstacle_min_clearance)
+        self.jump_obstacle_success_ready = (
+            self.obstacle_trial_crossed
+            & ~self.obstacle_trial_collision
+            & finite_clearance
+            & (self.obstacle_min_clearance >= cfg.minimum_clearance)
+        )
+
+        super()._pre_reward_update()
+
+        completed = (
+            self.obstacle_trial_triggered
+            & (self.jump_phase == mdp.JUMP_PHASE_IDLE)
+            & (self.jump_phase_time == 0.0)
+        )
+        obstacle_success = completed & self.jump_success_event
+        self._obstacle_successes[obstacle_success] += 1.0
+        self.obstacle_respawn_pending |= completed
+
+    def _log_debug_metrics(self):
+        super()._log_debug_metrics()
+        if not hasattr(self, "_obstacle_trials"):
+            return
+        log = dict(self.extras.get("log", {}))
+        trials = self._obstacle_trials.sum().clamp_min(1.0)
+        finite = torch.isfinite(self.obstacle_min_clearance)
+        log["obstacle_height"] = self.obstacle_height.mean().item()
+        log["obstacle_width"] = self.obstacle_width.mean().item()
+        log["obstacle_curriculum_level"] = float(
+            getattr(self, "_obstacle_curriculum_level", 0)
+        )
+        if hasattr(self, "_obstacle_curriculum_last_success"):
+            log["obstacle_curriculum_success"] = (
+                self._obstacle_curriculum_last_success.item()
+            )
+            log["obstacle_curriculum_clear"] = (
+                self._obstacle_curriculum_last_clear.item()
+            )
+            log["obstacle_curriculum_collision"] = (
+                self._obstacle_curriculum_last_collision.item()
+            )
+        log["obstacle_trigger_error"] = (
+            self.obstacle_trigger_error[self.obstacle_trial_triggered]
+            .abs()
+            .mean()
+            .item()
+            if self.obstacle_trial_triggered.any()
+            else 0.0
+        )
+        log["obstacle_min_clearance"] = (
+            self.obstacle_min_clearance[finite].mean().item()
+            if finite.any()
+            else 0.0
+        )
+        log["obstacle_clear_rate"] = (self._obstacle_clears.sum() / trials).item()
+        log["obstacle_collision_rate"] = (
+            self._obstacle_collisions.sum() / trials
+        ).item()
+        collision_count = self._obstacle_collisions.sum().clamp_min(1.0)
+        log["obstacle_collision_force_mean"] = (
+            self._obstacle_collision_force_sum.sum() / collision_count
+        ).item()
+        log["obstacle_collision_force_peak"] = (
+            self._obstacle_collision_force_peak.max().item()
+        )
+        body_counts = self._obstacle_collision_body_counts.sum(dim=0)
+        # Group symmetric links to keep the terminal line readable.
+        log["obstacle_collision_base_fraction"] = (
+            body_counts[0] / collision_count
+        ).item()
+        log["obstacle_collision_upper_leg_fraction"] = (
+            (body_counts[1] + body_counts[3]) / collision_count
+        ).item()
+        log["obstacle_collision_lower_leg_fraction"] = (
+            (body_counts[2] + body_counts[4]) / collision_count
+        ).item()
+        log["obstacle_collision_wheel_fraction"] = (
+            (body_counts[5] + body_counts[6]) / collision_count
+        ).item()
+        log["obstacle_success_rate"] = (
+            self._obstacle_successes.sum() / trials
+        ).item()
+        self.extras["log"] = log
+
+    def _reset_idx(self, env_ids):
+        super()._reset_idx(env_ids)
+        if not hasattr(self, "_obstacle_trials"):
+            return
+        self._obstacle_trials[env_ids] = 0.0
+        self._obstacle_clears[env_ids] = 0.0
+        self._obstacle_collisions[env_ids] = 0.0
+        self._obstacle_successes[env_ids] = 0.0
+        self._obstacle_collision_force_sum[env_ids] = 0.0
+        self._obstacle_collision_force_peak[env_ids] = 0.0
+        self._obstacle_collision_body_counts[env_ids] = 0.0
+        self._place_obstacle(env_ids)
 
 
 @configclass
@@ -580,6 +1085,42 @@ class WheelLeggedJumpObservationsCfg:
             clip=(-5.0, 5.0),
         )
         jump_phase_time = ObsTerm(func=mdp.jump_phase_time, clip=(0.0, 1.0))
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class WheelLeggedObstacleObservationsCfg(WheelLeggedJumpObservationsCfg):
+    """Jump observations augmented with a compact robot-aligned forward scan."""
+
+    @configclass
+    class PolicyCfg(WheelLeggedJumpObservationsCfg.PolicyCfg):
+        obstacle_forward_scan = ObsTerm(
+            func=mdp.obstacle_forward_scan,
+            params={
+                "distances": (
+                    0.10, 0.20, 0.30, 0.40, 0.50,
+                    0.60, 0.70, 0.80, 0.90, 1.00,
+                )
+            },
+            clip=(0.0, 0.10),
+            scale=10.0,
+        )
+
+    @configclass
+    class CriticCfg(WheelLeggedJumpObservationsCfg.CriticCfg):
+        obstacle_forward_scan = ObsTerm(
+            func=mdp.obstacle_forward_scan,
+            params={
+                "distances": (
+                    0.10, 0.20, 0.30, 0.40, 0.50,
+                    0.60, 0.70, 0.80, 0.90, 1.00,
+                )
+            },
+            clip=(0.0, 0.10),
+            scale=10.0,
+        )
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
@@ -1150,3 +1691,199 @@ class WheelLeggedMovingJumpCurriculumFlatEnvCfg(WheelLeggedMovingJumpFlatEnvCfg)
         # The L1 task intentionally rejected starts above 0.35 m/s. The
         # curriculum must permit jump triggers at every configured level.
         self.jump_state_machine.start_max_speed = 1.20
+
+
+@configclass
+class WheelLeggedTargetLandingCommandsCfg(WheelLeggedMovingJumpCurriculumCommandsCfg):
+    """Full-range moving jumps with velocity-feasible landing displacement."""
+
+    jump_command = mdp.JumpCommandCfg(
+        resampling_time_range=(3.5, 4.5),
+        jump_probability=0.85,
+        trigger_delay_range=(0.7, 1.1),
+        trigger_pulse_time=0.10,
+        target_height_range=(0.08, 0.12),
+        # The target is recomputed from the signed locomotion command when the
+        # pulse starts: d = vx_cmd * expected_air_time * noise.
+        target_distance_range=(-0.16, 0.16),
+        couple_distance_to_velocity=True,
+        expected_air_time=0.16,
+        distance_noise_range=(0.90, 1.10),
+    )
+
+
+@configclass
+class WheelLeggedTargetLandingRewardsCfg(WheelLeggedMovingJumpCurriculumRewardsCfg):
+    """Add dense approach and first-touchdown target-position objectives."""
+
+    jump_target_progress = RewardTermCfg(
+        func=mdp.jump_target_landing_progress,
+        weight=8.0,
+        params={"std": 0.10},
+    )
+    jump_target_landing = RewardTermCfg(
+        func=mdp.jump_target_landing_tracking,
+        weight=180.0,
+        params={"std": 0.05},
+    )
+    # Success now includes target accuracy, so its sparse credit may remain
+    # comparable to the proven moving-jump stage.
+    jump_success = RewardTermCfg(func=mdp.jump_success_bonus, weight=280.0)
+
+
+@configclass
+class WheelLeggedTargetLandingFlatEnvCfg(
+    WheelLeggedMovingJumpCurriculumFlatEnvCfg
+):
+    """Stage D1: land near a commanded planar point on unobstructed flat ground."""
+
+    commands: WheelLeggedTargetLandingCommandsCfg = (
+        WheelLeggedTargetLandingCommandsCfg()
+    )
+    rewards: WheelLeggedTargetLandingRewardsCfg = (
+        WheelLeggedTargetLandingRewardsCfg()
+    )
+    curriculum = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands = WheelLeggedTargetLandingCommandsCfg()
+        self.rewards = WheelLeggedTargetLandingRewardsCfg()
+        self.curriculum = None
+
+        # Cover the final locomotion envelope. Signed distance commands make
+        # backward jumps target a point behind the takeoff pose.
+        command = self.commands.wheel_legged_commands
+        command.ranges.lin_vel_x = (-1.0, 1.0)
+        command.ranges.ang_vel_yaw = (-1.20, 1.20)
+
+        state = self.jump_state_machine
+        state.start_max_speed = 1.0
+        state.success_max_recovery_vx_error = 0.18
+        state.success_max_landing_position_error = 0.05
+
+
+@configclass
+class WheelLeggedObstacleOracleCommandsCfg(WheelLeggedTargetLandingCommandsCfg):
+    """Forward approach commands; the environment supplies every jump pulse."""
+
+    wheel_legged_commands = mdp.WheelLeggedCommandCfg(
+        asset_name="robot",
+        resampling_time_range=(5.0, 7.0),
+        heading_command=True,
+        heading_control_stiffness=0.8,
+        rel_heading_envs=1.0,
+        hold_command_during_jump=True,
+        ranges=mdp.WheelLeggedCommandCfg.Ranges(
+            lin_vel_x=(0.45, 0.75),
+            ang_vel_yaw=(-0.40, 0.40),
+            height=(0.20, 0.22),
+            heading=(0.0, 0.0),
+        ),
+    )
+    jump_command = mdp.JumpCommandCfg(
+        resampling_time_range=(1.0e9, 1.0e9),
+        jump_probability=0.0,
+        trigger_delay_range=(1.0e9, 1.0e9),
+        trigger_pulse_time=0.10,
+        target_height_range=(0.08, 0.10),
+        target_distance_range=(0.105, 0.105),
+        couple_distance_to_velocity=False,
+    )
+
+
+@configclass
+class WheelLeggedObstacleOracleRewardsCfg(WheelLeggedTargetLandingRewardsCfg):
+    """Prioritize clean barrier crossing while retaining landing quality."""
+
+    obstacle_clearance = RewardTermCfg(
+        func=mdp.obstacle_clearance_tracking,
+        weight=18.0,
+        params={"target_clearance": 0.025, "std": 0.020},
+    )
+    obstacle_crossing = RewardTermCfg(
+        func=mdp.obstacle_crossing_bonus,
+        weight=220.0,
+    )
+    obstacle_collision = RewardTermCfg(
+        func=mdp.obstacle_collision_penalty,
+        weight=-300.0,
+    )
+    jump_success = RewardTermCfg(func=mdp.jump_success_bonus, weight=320.0)
+
+
+@configclass
+class WheelLeggedObstacleGeometryCurriculumCfg:
+    """Joint 2→4→6→8 cm height and narrow→wide barrier curriculum."""
+
+    geometry_levels = CurriculumTermCfg(
+        func=mdp.obstacle_geometry_curriculum,
+        params={
+            "height_levels": (0.02, 0.04, 0.06, 0.08),
+            "width_levels": (0.035, 0.050, 0.065, 0.080),
+            "initial_level": 0,
+            "success_threshold": 0.60,
+            "clear_threshold": 0.75,
+            # This is an advancement gate, not the final acceptance target.
+            # Level 0 already clears reliably, but requiring <=10% wheel
+            # contact keeps it overfitting the 2 cm barrier indefinitely.
+            "collision_threshold": 0.25,
+            "min_trials": 1024,
+            "consecutive_passes": 2,
+        },
+    )
+
+
+@configclass
+class WheelLeggedObstacleOracleFlatEnvCfg(WheelLeggedTargetLandingFlatEnvCfg):
+    """Stage D2: analytic triggering over one exact-geometry low barrier."""
+
+    scene: WheelLeggedObstacleSceneCfg = WheelLeggedObstacleSceneCfg(
+        num_envs=4096, env_spacing=4.0
+    )
+    observations: WheelLeggedObstacleObservationsCfg = (
+        WheelLeggedObstacleObservationsCfg()
+    )
+    commands: WheelLeggedObstacleOracleCommandsCfg = (
+        WheelLeggedObstacleOracleCommandsCfg()
+    )
+    rewards: WheelLeggedObstacleOracleRewardsCfg = (
+        WheelLeggedObstacleOracleRewardsCfg()
+    )
+    obstacle_oracle: ObstacleOracleCfg = ObstacleOracleCfg()
+    curriculum: WheelLeggedObstacleGeometryCurriculumCfg = (
+        WheelLeggedObstacleGeometryCurriculumCfg()
+    )
+    env_class = WheelLeggedObstacleOracleEnv
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations = WheelLeggedObstacleObservationsCfg()
+        self.commands = WheelLeggedObstacleOracleCommandsCfg()
+        self.rewards = WheelLeggedObstacleOracleRewardsCfg()
+        self.curriculum = WheelLeggedObstacleGeometryCurriculumCfg()
+        self.obstacle_oracle = ObstacleOracleCfg()
+        for name in (
+            "obstacle_contact_base",
+            "obstacle_contact_lf0",
+            "obstacle_contact_lf1",
+            "obstacle_contact_rf0",
+            "obstacle_contact_rf1",
+            "obstacle_contact_lwheel",
+            "obstacle_contact_rwheel",
+        ):
+            getattr(self.scene, name).update_period = self.sim.dt
+        # Keep the first oracle lane approximately aligned with commanded
+        # world heading. Wider yaw randomization and pushes return with the
+        # perception/curriculum stage.
+        self.events.reset_base.params["pose_range"]["yaw"] = (-0.15, 0.15)
+        self.events.push_robot = None
+
+        state = self.jump_state_machine
+        state.start_max_speed = 0.90
+        # Obstacle success is defined primarily by actual wheel clearance,
+        # clean crossing, air time and landing. Retraction can produce useful
+        # wheel clearance without raising the base by 75% of the command.
+        state.success_height_ratio = 0.50
+        state.success_max_recovery_vx_error = 0.18
+        state.success_max_landing_position_error = 0.05

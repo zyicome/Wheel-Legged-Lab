@@ -123,3 +123,23 @@ class WheelLeggedMovingJumpCurriculumPPORunnerCfg(WheelLeggedMovingJumpPPORunner
     experiment_name = "wheel_legged_jump_moving_curriculum_flat"
     max_iterations = 4000
     save_interval = 100
+
+
+@configclass
+class WheelLeggedTargetLandingPPORunnerCfg(
+    WheelLeggedMovingJumpCurriculumPPORunnerCfg
+):
+    """Stage-D1 runner for commanded flat-ground landing positions."""
+
+    experiment_name = "wheel_legged_jump_target_landing_flat"
+    max_iterations = 2200
+    save_interval = 100
+
+
+@configclass
+class WheelLeggedObstacleOraclePPORunnerCfg(WheelLeggedTargetLandingPPORunnerCfg):
+    """Stage-D2 runner for exact-geometry low-obstacle crossing."""
+
+    experiment_name = "wheel_legged_jump_obstacle_oracle_flat"
+    max_iterations = 2400
+    save_interval = 100

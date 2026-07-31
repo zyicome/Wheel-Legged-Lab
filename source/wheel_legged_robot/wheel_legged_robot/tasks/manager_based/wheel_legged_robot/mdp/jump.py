@@ -273,6 +273,9 @@ class JumpCommand(CommandTerm):
         self._elapsed = torch.zeros(self.num_envs, device=self.device)
         self._trigger_delay = torch.zeros(self.num_envs, device=self.device)
         self._enabled = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._pulse_active = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
 
     @property
     def command(self) -> torch.Tensor:
@@ -288,7 +291,11 @@ class JumpCommand(CommandTerm):
             *self.cfg.trigger_delay_range
         )
         target_height = torch.empty(count, device=self.device).uniform_(*self.cfg.target_height_range)
-        target_distance = torch.empty(count, device=self.device).uniform_(*self.cfg.target_distance_range)
+        target_distance = torch.empty(count, device=self.device).uniform_(
+            *self.cfg.target_distance_range
+        )
+        if self.cfg.couple_distance_to_velocity:
+            target_distance = self._distance_from_velocity(env_ids)
         self._command[env_ids, 0] = 0.0
         self._command[env_ids, 1] = torch.where(
             self._enabled[env_ids], target_height, torch.zeros_like(target_height)
@@ -304,7 +311,34 @@ class JumpCommand(CommandTerm):
             & (self._elapsed >= self._trigger_delay)
             & (self._elapsed < self._trigger_delay + self.cfg.trigger_pulse_time)
         )
+        # Recompute and latch the target on the rising edge. This uses the
+        # locomotion command that will actually be held by the jump state
+        # machine, instead of a possibly stale value from command resampling.
+        pulse_start = pulse & ~self._pulse_active
+        if self.cfg.couple_distance_to_velocity and pulse_start.any():
+            env_ids = pulse_start.nonzero(as_tuple=False).squeeze(-1)
+            self._command[env_ids, 2] = self._distance_from_velocity(env_ids)
         self._command[:, 0] = pulse.float()
+        self._pulse_active[:] = pulse
+
+    def _distance_from_velocity(self, env_ids: Sequence[int]) -> torch.Tensor:
+        """Predict signed landing displacement from commanded takeoff speed."""
+        count = len(env_ids)
+        if count == 0:
+            return torch.empty(0, device=self.device)
+        locomotion_command = self._env.command_manager.get_command(
+            self.cfg.velocity_command_name
+        )
+        vx = locomotion_command[env_ids, 0]
+        noise = torch.empty(count, device=self.device).uniform_(
+            *self.cfg.distance_noise_range
+        )
+        distance = vx * self.cfg.expected_air_time * noise
+        return torch.clamp(
+            distance,
+            min=self.cfg.target_distance_range[0],
+            max=self.cfg.target_distance_range[1],
+        )
 
     def _update_metrics(self):
         pass
@@ -321,6 +355,10 @@ class JumpCommandCfg(CommandTermCfg):
     trigger_pulse_time: float = 0.10
     target_height_range: tuple[float, float] = (0.03, 0.07)
     target_distance_range: tuple[float, float] = (0.0, 0.0)
+    couple_distance_to_velocity: bool = False
+    velocity_command_name: str = "wheel_legged_commands"
+    expected_air_time: float = 0.16
+    distance_noise_range: tuple[float, float] = (1.0, 1.0)
 
 
 def jump_phase_one_hot(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -547,6 +585,60 @@ def jump_landing_velocity_tracking(
         -(env.jump_landing_vx - env.jump_target_vx).square() / std**2
     )
     return quality * env.jump_landing_event.float()
+
+
+def jump_target_landing_progress(
+    env: ManagerBasedRLEnv, std: float = 0.10
+) -> torch.Tensor:
+    """Dense flight reward for approaching the commanded planar landing point."""
+    if not hasattr(env, "jump_target_position_w"):
+        return torch.zeros(env.num_envs, device=env.device)
+    error = torch.linalg.vector_norm(
+        env.scene["robot"].data.root_pos_w[:, :2] - env.jump_target_position_w,
+        dim=1,
+    )
+    quality = torch.exp(-error.square() / std**2)
+    airborne = (~env.jump_wheel_contact.any(dim=1)) & env._jump_airborne_ever
+    return quality * airborne.float() * _phase_mask(env, JUMP_PHASE_FLIGHT)
+
+
+def jump_target_landing_tracking(
+    env: ManagerBasedRLEnv, std: float = 0.05
+) -> torch.Tensor:
+    """One-step reward for first-contact proximity to the commanded target."""
+    if not hasattr(env, "jump_landing_position_error"):
+        return torch.zeros(env.num_envs, device=env.device)
+    quality = torch.exp(-env.jump_landing_position_error.square() / std**2)
+    return quality * env.jump_landing_event.float()
+
+
+def obstacle_clearance_tracking(
+    env: ManagerBasedRLEnv, target_clearance: float = 0.025, std: float = 0.02
+) -> torch.Tensor:
+    """Reward wheel-bottom clearance while both wheels pass over the barrier."""
+    if not hasattr(env, "obstacle_min_clearance"):
+        return torch.zeros(env.num_envs, device=env.device)
+    clearance = env.obstacle_min_clearance
+    finite = torch.isfinite(clearance)
+    progress = torch.clamp(clearance / target_clearance, 0.0, 1.0)
+    tracking = torch.exp(-(clearance - target_clearance).square() / std**2)
+    quality = torch.where(finite, 0.7 * progress + 0.3 * tracking, 0.0)
+    return quality * _phase_mask(env, JUMP_PHASE_FLIGHT)
+
+
+def obstacle_crossing_bonus(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """One-step credit for crossing the far obstacle edge without contact."""
+    if not hasattr(env, "obstacle_cross_event"):
+        return torch.zeros(env.num_envs, device=env.device)
+    clean = env.obstacle_cross_event & ~env.obstacle_trial_collision
+    return clean.float()
+
+
+def obstacle_collision_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """One-step event for the first robot-obstacle contact in each trial."""
+    if not hasattr(env, "obstacle_collision_event"):
+        return torch.zeros(env.num_envs, device=env.device)
+    return env.obstacle_collision_event.float()
 
 
 def jump_airborne_reward(env: ManagerBasedRLEnv) -> torch.Tensor:

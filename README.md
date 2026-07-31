@@ -283,6 +283,85 @@ logs/rsl_rl/wheel_legged_flat/<timestamp>_<run_name>/
 
 不要把未经转换的平地 checkpoint 直接加载到跳跃任务。平地策略缺少跳跃观测，需要先使用 `scripts/expand_rsl_checkpoint_for_jump.py` 扩展首层网络和归一化器。
 
+### 训练目标落点阶段
+
+`Wheel-Legged-Jump-Target-Landing-Flat-v0` 在现有 8–12 cm 移动跳跃能力上
+加入与速度一致的目标落点。触发跳跃时按照
+`target_distance = vx_command × 0.16 s × U(0.9, 1.1)` 锁存带符号距离，并
+限制在 `[-0.16, 0.16] m`；因此前进命令对应前方落点，后退命令对应后方落点。
+目标点以起跳瞬间的位置和机头方向定义，不会退化成只沿世界 X 轴跳跃。训练覆盖
+`vx ∈ [-1, 1] m/s` 和最大 `wz ∈ [-1.2, 1.2] rad/s`。该任务仍使用原来的
+48 维跳跃观测，可以直接迁移最终移动跳跃 checkpoint：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Jump-Target-Landing-Flat-v0 \
+  --headless \
+  --num_envs 4096 \
+  --load_checkpoint_path checkpoints/wheel_legged_moving_jump_model_844.pt \
+  --load_weights_only \
+  --run_name target_landing
+```
+
+训练时重点观察 `J落点误差` 和 `J落点成功`。默认成功条件是首次触地位置与目标
+二维距离不超过 0.05 m，同时仍需满足原有的起跳高度、轮端净空、滞空、柔和
+落地、速度恢复和姿态恢复条件。固定 0.10 m 落点进行 Play：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Target-Landing-Flat-v0 \
+  --checkpoint /absolute/path/to/target_landing/model_1000.pt \
+  --num_envs 10 \
+  --command_range 1.0 \
+  --yaw_command_range 1.2 \
+  --jump_height 0.10 \
+  --jump_distance 0.10
+```
+
+### 训练 Oracle 障碍物阶段
+
+`Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0` 在每个环境中放置一个横跨行驶
+方向的刚性障碍物。第一阶段随机暴露高度为 2–4 cm、宽度为 3.5 cm，环境根据
+障碍物距离和当前速度解析计算触发时机：
+
+```text
+trigger_distance = |vx_command| × 0.44 s + 0.03 m
+```
+
+低层策略不需要新增障碍物观测，仍接收原来的 48 维跳跃输入，因此可以直接迁移
+目标落点模型：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0 \
+  --headless \
+  --num_envs 4096 \
+  --load_checkpoint_path /absolute/path/to/target_landing/model_xxx.pt \
+  --load_weights_only \
+  --run_name obstacle_oracle_low
+```
+
+第一阶段接近速度限制为 0.45–0.75 m/s。训练时重点观察：
+
+```text
+O触发误差  趋近 0
+O净空      最终大于 0.015 m
+O跨越      最终大于 0.80
+O碰撞      最终小于 0.03
+O成功      最终大于 0.70
+```
+
+使用训练后的模型进行自动越障 Play：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0 \
+  --checkpoint /absolute/path/to/obstacle_oracle/model_xxx.pt \
+  --num_envs 10 \
+  --command_range 0.75 \
+  --yaw_command_range 0.4
+```
+
 ### 一键完成全部阶段
 
 从平地训练开始，达到各阶段指标后自动切换任务：
@@ -443,7 +522,9 @@ tensorboard --logdir logs/rsl_rl --port 6006
 - [x] 补充 Wheel-Legged-Gym 模型来源、修改记录与 BSD 3-Clause 许可证；
 - [x] 补充训练与 Play 的 GIF/视频；
 - [x] 发布可复现 checkpoint 与 TensorBoard 曲线；
-- [ ] 增加障碍物地形和目标落点命令；
+- [x] 增加平地目标落点命令与落点精度训练阶段；
+- [x] 增加低障碍物 Oracle 触发与实体碰撞训练阶段；
+- [ ] 增加障碍物高度/宽度课程与前向地形感知；
 - [ ] 从外部触发跳跃扩展到感知驱动的自主越障；
 - [ ] 加入多随机种子评估和自动回归测试；
 - [ ] 完成延迟、噪声、摩擦和电机参数随机化；

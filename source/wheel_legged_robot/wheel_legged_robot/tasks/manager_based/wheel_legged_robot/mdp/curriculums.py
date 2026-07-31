@@ -312,3 +312,71 @@ def moving_jump_speed_curriculum(
         env._moving_jump_speed_levels[env._moving_jump_curriculum_level],
         device=env.device,
     )
+
+
+def obstacle_geometry_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    height_levels: tuple[float, ...] = (0.02, 0.04, 0.06, 0.08),
+    width_levels: tuple[float, ...] = (0.035, 0.050, 0.065, 0.080),
+    initial_level: int = 0,
+    success_threshold: float = 0.65,
+    clear_threshold: float = 0.80,
+    collision_threshold: float = 0.05,
+    min_trials: int = 1024,
+    consecutive_passes: int = 2,
+) -> torch.Tensor:
+    """Advance real obstacle geometry after consecutive reliable trial windows."""
+    if len(height_levels) != len(width_levels) or not height_levels:
+        raise ValueError("height_levels and width_levels must have equal non-zero length.")
+    if not hasattr(env, "_obstacle_curriculum_level"):
+        if not 0 <= initial_level < len(height_levels):
+            raise ValueError(f"initial_level must be in [0, {len(height_levels) - 1}].")
+        env._obstacle_height_levels = tuple(float(v) for v in height_levels)
+        env._obstacle_width_levels = tuple(float(v) for v in width_levels)
+        env._obstacle_curriculum_level = int(initial_level)
+        env._obstacle_curriculum_passes = 0
+        env._obstacle_curriculum_trials = torch.zeros((), device=env.device)
+        env._obstacle_curriculum_clears = torch.zeros((), device=env.device)
+        env._obstacle_curriculum_collisions = torch.zeros((), device=env.device)
+        env._obstacle_curriculum_successes = torch.zeros((), device=env.device)
+        env._obstacle_curriculum_last_clear = torch.zeros((), device=env.device)
+        env._obstacle_curriculum_last_collision = torch.zeros((), device=env.device)
+        env._obstacle_curriculum_last_success = torch.zeros((), device=env.device)
+        return torch.tensor(float(initial_level), device=env.device)
+
+    if len(env_ids) == 0 or not hasattr(env, "_obstacle_trials"):
+        return torch.tensor(float(env._obstacle_curriculum_level), device=env.device)
+    env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=env.device)
+    env._obstacle_curriculum_trials += env._obstacle_trials[env_ids].sum()
+    env._obstacle_curriculum_clears += env._obstacle_clears[env_ids].sum()
+    env._obstacle_curriculum_collisions += env._obstacle_collisions[env_ids].sum()
+    env._obstacle_curriculum_successes += env._obstacle_successes[env_ids].sum()
+
+    if env._obstacle_curriculum_trials.item() >= min_trials:
+        trials = env._obstacle_curriculum_trials.clamp_min(1.0)
+        clear_rate = env._obstacle_curriculum_clears / trials
+        collision_rate = env._obstacle_curriculum_collisions / trials
+        success_rate = env._obstacle_curriculum_successes / trials
+        env._obstacle_curriculum_last_clear = clear_rate.detach().clone()
+        env._obstacle_curriculum_last_collision = collision_rate.detach().clone()
+        env._obstacle_curriculum_last_success = success_rate.detach().clone()
+        passed = (
+            success_rate.item() >= success_threshold
+            and clear_rate.item() >= clear_threshold
+            and collision_rate.item() <= collision_threshold
+        )
+        env._obstacle_curriculum_passes = (
+            env._obstacle_curriculum_passes + 1 if passed else 0
+        )
+        if (
+            env._obstacle_curriculum_passes >= consecutive_passes
+            and env._obstacle_curriculum_level < len(env._obstacle_height_levels) - 1
+        ):
+            env._obstacle_curriculum_level += 1
+            env._obstacle_curriculum_passes = 0
+        env._obstacle_curriculum_trials.zero_()
+        env._obstacle_curriculum_clears.zero_()
+        env._obstacle_curriculum_collisions.zero_()
+        env._obstacle_curriculum_successes.zero_()
+    return torch.tensor(float(env._obstacle_curriculum_level), device=env.device)

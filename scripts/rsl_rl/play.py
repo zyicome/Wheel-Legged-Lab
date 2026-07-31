@@ -65,6 +65,12 @@ parser.add_argument(
     help="Fix jump target height in meters (for example 0.12 for clearance evaluation).",
 )
 parser.add_argument(
+    "--jump_distance",
+    type=float,
+    default=None,
+    help="Fix the forward landing-target distance in meters.",
+)
+parser.add_argument(
     "--print_interval",
     type=int,
     default=100,
@@ -165,7 +171,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     if hasattr(env_cfg.commands, "wheel_legged_commands"):
         command_cfg = env_cfg.commands.wheel_legged_commands
-        command_cfg.ranges.lin_vel_x = (-args_cli.command_range, args_cli.command_range)
+        if (
+            task_name == "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0"
+            and not args_cli.keyboard
+        ):
+            command_cfg.ranges.lin_vel_x = (
+                0.45,
+                max(0.45, args_cli.command_range),
+            )
+        else:
+            command_cfg.ranges.lin_vel_x = (
+                -args_cli.command_range,
+                args_cli.command_range,
+            )
         command_cfg.ranges.ang_vel_yaw = (
             -args_cli.yaw_command_range,
             args_cli.yaw_command_range,
@@ -179,6 +197,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         jump_height = max(0.0, args_cli.jump_height)
         env_cfg.commands.jump_command.target_height_range = (jump_height, jump_height)
         print(f"[INFO] Fixed jump target height: {jump_height:.3f} m")
+    if args_cli.jump_distance is not None and hasattr(env_cfg.commands, "jump_command"):
+        jump_distance = float(args_cli.jump_distance)
+        env_cfg.commands.jump_command.target_distance_range = (
+            jump_distance,
+            jump_distance,
+        )
+        # An explicit evaluation target takes precedence over the training
+        # stage's automatic velocity-to-distance coupling.
+        env_cfg.commands.jump_command.couple_distance_to_velocity = False
+        print(f"[INFO] Fixed jump target distance: {jump_distance:.3f} m")
     if hasattr(env_cfg, "curriculum") and hasattr(env_cfg.curriculum, "command_levels"):
         env_cfg.curriculum.command_levels = None
     if hasattr(env_cfg, "curriculum") and hasattr(env_cfg.curriculum, "speed_levels"):
@@ -233,6 +261,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             default_height=args_cli.keyboard_height,
             height_step=args_cli.keyboard_height_step,
             jump_height=args_cli.jump_height,
+            jump_distance=args_cli.jump_distance,
         )
 
     command_term = env.unwrapped.command_manager._terms.get("wheel_legged_commands")

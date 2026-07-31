@@ -53,6 +53,7 @@ WHEEL_LEGGED_DEBUG_METRICS: tuple[tuple[str, str], ...] = (
     ("jump_phase_landing", "J落"),
     ("jump_phase_recovery", "J稳"),
     ("jump_target_height", "J目标"),
+    ("jump_target_distance", "J目标距"),
     ("jump_target_vx", "J目标vx"),
     ("jump_takeoff_vz", "J起速"),
     ("jump_takeoff_vx_error", "J起vx误差"),
@@ -64,6 +65,8 @@ WHEEL_LEGGED_DEBUG_METRICS: tuple[tuple[str, str], ...] = (
     ("jump_air_time", "J空时"),
     ("jump_success_rate", "J成功"),
     ("jump_soft_landing_rate", "J柔落"),
+    ("jump_landing_position_error", "J落点误差"),
+    ("jump_target_landing_rate", "J落点成功"),
     ("jump_fail_crouch_rate", "F蹲"),
     ("jump_fail_thrust_rate", "F蹬"),
     ("jump_fail_unload_rate", "F卸"),
@@ -72,6 +75,23 @@ WHEEL_LEGGED_DEBUG_METRICS: tuple[tuple[str, str], ...] = (
     ("jump_crouch_l0", "J蹲L"),
     ("jump_thrust_l0", "J蹬L"),
     ("jump_thrust_l0_dot", "J蹬dL"),
+    ("obstacle_height", "O高"),
+    ("obstacle_width", "O宽"),
+    ("obstacle_curriculum_level", "O档"),
+    ("obstacle_curriculum_success", "O课成功"),
+    ("obstacle_curriculum_clear", "O课跨越"),
+    ("obstacle_curriculum_collision", "O课碰撞"),
+    ("obstacle_trigger_error", "O触发误差"),
+    ("obstacle_min_clearance", "O净空"),
+    ("obstacle_clear_rate", "O跨越"),
+    ("obstacle_collision_rate", "O碰撞"),
+    ("obstacle_collision_force_mean", "O撞力均"),
+    ("obstacle_collision_force_peak", "O撞力峰"),
+    ("obstacle_collision_base_fraction", "O撞基"),
+    ("obstacle_collision_upper_leg_fraction", "O撞大腿"),
+    ("obstacle_collision_lower_leg_fraction", "O撞小腿"),
+    ("obstacle_collision_wheel_fraction", "O撞轮"),
+    ("obstacle_success_rate", "O成功"),
 )
 
 
@@ -193,6 +213,7 @@ class WheelLeggedKeyboardController:
         default_height: float = 0.21,
         height_step: float = 0.01,
         jump_height: float | None = None,
+        jump_distance: float | None = None,
     ):
         self.env = env.unwrapped
         self.command_term = self.env.command_manager.get_term("wheel_legged_commands")
@@ -205,6 +226,7 @@ class WheelLeggedKeyboardController:
         self._jump_pulse_steps_remaining = 0
         self._jump_pulse_steps = 1
         self.jump_height = 0.0
+        self.jump_distance = 0.0
         if self.jump_command_term is not None:
             jump_range = self.jump_command_term.cfg.target_height_range
             default_jump_height = 0.5 * (float(jump_range[0]) + float(jump_range[1]))
@@ -214,6 +236,19 @@ class WheelLeggedKeyboardController:
             self.jump_height = min(
                 max(self.jump_height, float(jump_range[0])),
                 float(jump_range[1]),
+            )
+            distance_range = self.jump_command_term.cfg.target_distance_range
+            default_jump_distance = 0.5 * (
+                float(distance_range[0]) + float(distance_range[1])
+            )
+            self.jump_distance = (
+                default_jump_distance
+                if jump_distance is None
+                else float(jump_distance)
+            )
+            self.jump_distance = min(
+                max(self.jump_distance, float(distance_range[0])),
+                float(distance_range[1]),
             )
             self._jump_pulse_steps = max(
                 1,
@@ -253,7 +288,7 @@ class WheelLeggedKeyboardController:
             self.jump_command_term._enabled.zero_()
             self.jump_command_term._command[:, 0] = 0.0
             self.jump_command_term._command[:, 1] = self.jump_height
-            self.jump_command_term._command[:, 2] = 0.0
+            self.jump_command_term._command[:, 2] = self.jump_distance
         self.update()
 
         print(self.keyboard)
@@ -267,6 +302,7 @@ class WheelLeggedKeyboardController:
             print(
                 "\tJump: J (one jump per press)\n"
                 f"\tJump target height: {self.jump_height:.3f} m"
+                f", distance: {self.jump_distance:.3f} m"
             )
 
     def _raise_height(self):
@@ -288,7 +324,10 @@ class WheelLeggedKeyboardController:
             print("[KEYBOARD] jump ignored: previous jump is still active.")
             return
         self._jump_pulse_steps_remaining = self._jump_pulse_steps
-        print(f"[KEYBOARD] jump requested, target={self.jump_height:.3f} m")
+        print(
+            "[KEYBOARD] jump requested, "
+            f"height={self.jump_height:.3f} m, distance={self.jump_distance:.3f} m"
+        )
 
     def update(self):
         """Copy keyboard state and advance the finite jump trigger pulse."""
@@ -302,7 +341,7 @@ class WheelLeggedKeyboardController:
             jump_command = self.jump_command_term.command
             jump_command[:, 0] = float(self._jump_pulse_steps_remaining > 0)
             jump_command[:, 1] = self.jump_height
-            jump_command[:, 2] = 0.0
+            jump_command[:, 2] = self.jump_distance
             self._jump_pulse_steps_remaining = max(
                 0, self._jump_pulse_steps_remaining - 1
             )
