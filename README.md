@@ -443,7 +443,14 @@ Play 不恢复训练时的课程状态；没有显式参数时会从第 0 档开
 
 ### 一键完成全部阶段
 
-从平地训练开始，达到各阶段指标后自动切换任务：
+流水线现在覆盖七个阶段：
+
+```text
+flat → jump_flat → high_landing → clearance → moving_curriculum
+     → target_landing → obstacle_oracle
+```
+
+从平地开始并训练到最终障碍物阶段：
 
 ```bash
 ./scripts/rsl_rl/train_staged.sh \
@@ -453,60 +460,52 @@ Play 不恢复训练时的课程状态；没有显式参数时会从第 0 档开
   --seed 42
 ```
 
-如果已经有合格的平地 checkpoint，可以跳过平地训练：
+新增 `--end-stage`，用于指定最后一个需要实际训练并验收的阶段（包含该
+阶段）。例如只训练到 Clearance：
+
+```bash
+./scripts/rsl_rl/train_staged.sh --end-stage clearance
+```
+
+也可以与已有的中间恢复功能组合：
 
 ```bash
 ./scripts/rsl_rl/train_staged.sh \
-  --isaaclab-path "${ISAACLAB_ROOT}" \
-  --start-checkpoint /absolute/path/to/wheel_legged_flat/model_1999.pt \
-  --start-stage flat \
-  --start-mode next
+  --start-checkpoint /absolute/path/to/model.pt \
+  --start-stage moving_curriculum \
+  --start-mode next \
+  --end-stage obstacle_oracle
 ```
 
-也可以从任意中间阶段恢复。三个参数必须一起提供：
+恢复参数含义：
 
 | 参数 | 含义 |
 |---|---|
 | `--start-checkpoint` | 用作恢复或迁移起点的模型文件 |
 | `--start-stage` | 该模型所属阶段，而不是准备进入的阶段 |
-| `--start-mode continue` | 恢复当前阶段的网络、优化器和 iteration；达标后再自动切换 |
-| `--start-mode next` | 确认当前阶段已经合格，跳过其验收并将网络权重迁移至下一阶段 |
+| `--start-mode continue` | 恢复当前阶段的网络、优化器和 iteration，并继续验收 |
+| `--start-mode next` | 确认来源阶段合格，只迁移权重并从下一阶段开始 |
+| `--end-stage` | 最后训练和验收的阶段；默认 `obstacle_oracle` |
 
-可用的阶段名称依次为：
+可用阶段名称为：
 
 ```text
-flat → jump_flat → high_landing → clearance → moving_curriculum
+flat, jump_flat, high_landing, clearance,
+moving_curriculum, target_landing, obstacle_oracle
 ```
 
-例如，继续训练一个尚未完全达标的 High-Landing 模型：
+`--end-stage` 不能早于实际开始训练的阶段。最终 `obstacle_oracle` 后没有下一
+阶段，所以从该阶段 checkpoint 启动时应使用 `--start-mode continue`。
+旧参数 `--flat-checkpoint PATH` 仍兼容，等价于 `flat + next`。
 
-```bash
-./scripts/rsl_rl/train_staged.sh \
-  --isaaclab-path "${ISAACLAB_ROOT}" \
-  --start-checkpoint \
-  /absolute/path/to/wheel_legged_jump_high_landing_flat/model_800.pt \
-  --start-stage high_landing \
-  --start-mode continue
-```
+流水线使用最近 `20` 个 iteration 的训练指标滑动平均，并连续 `3` 次通过后
+切换任务。门槛已根据历史训练日志适度放宽，但仍联合检查真实净空、碰撞、
+落点、恢复和力矩安全，避免只靠成功率尖峰晋级。Target Landing 到 Obstacle
+Oracle 时新增的 10 维障碍物扫描观测由 `train.py` 自动扩展 checkpoint 输入。
+某阶段达到最大 iteration 仍未通过时，流程会停止并保留 checkpoint。
 
-如果已经确认这个 High-Landing 模型合格，直接进入 Clearance：
-
-```bash
-./scripts/rsl_rl/train_staged.sh \
-  --isaaclab-path "${ISAACLAB_ROOT}" \
-  --start-checkpoint \
-  /absolute/path/to/wheel_legged_jump_high_landing_flat/model_800.pt \
-  --start-stage high_landing \
-  --start-mode next
-```
-
-最终阶段 `moving_curriculum` 后面没有其他阶段，因此只能选择
-`--start-mode continue`。旧参数 `--flat-checkpoint PATH` 仍然兼容，
-等价于以 `flat + next` 模式启动。
-
-流水线使用最近一段训练指标的滑动平均决定是否晋级。如果某一阶段达到最大训练轮数仍未通过，流程会停止并保留 checkpoint，不会把未达标模型继续传给更困难的任务。
-
-详细说明见 [STAGED_TRAINING.md](STAGED_TRAINING.md)。
+详细阶段、当前验收数值和恢复示例见
+[STAGED_TRAINING.md](STAGED_TRAINING.md)。
 
 ### 查看训练结果
 

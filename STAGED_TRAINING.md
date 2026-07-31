@@ -1,32 +1,38 @@
 # 轮腿机器人一键分阶段训练
 
-## 1. 目标
+## 1. 目标与完整阶段
 
-自动训练并依次迁移：
+流水线现在覆盖从基础平地到 Oracle 实体障碍物的全部七个阶段：
+
+```text
+flat
+→ jump_flat
+→ high_landing
+→ clearance
+→ moving_curriculum
+→ target_landing
+→ obstacle_oracle
+```
+
+对应任务：
 
 ```text
 Wheel-Legged-Flat-v0
-  → Wheel-Legged-Jump-Flat-v0
-  → Wheel-Legged-Jump-High-Landing-Flat-v0
-  → Wheel-Legged-Jump-Clearance-Flat-v0
-  → Wheel-Legged-Jump-Moving-Curriculum-Flat-v0
+→ Wheel-Legged-Jump-Flat-v0
+→ Wheel-Legged-Jump-High-Landing-Flat-v0
+→ Wheel-Legged-Jump-Clearance-Flat-v0
+→ Wheel-Legged-Jump-Moving-Curriculum-Flat-v0
+→ Wheel-Legged-Jump-Target-Landing-Flat-v0
+→ Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0
 ```
 
-外层流水线负责在任务之间迁移，最后一个任务内部已有的课程负责把移动
-速度从 `0.2` 自动提高到 `1.0 m/s`。不再需要人工查看一次 Play 再手动
-拼接下一条训练命令。
+外层流水线负责任务切换、checkpoint 迁移和自动验收；移动跳跃任务内部把
+速度从 `0.2` 自动提高到 `1.0 m/s`，障碍物任务内部把几何从第 0 档提高到
+第 6 档。
 
-## 2. 一条命令从头训练
+## 2. 从头训练或只训练到指定阶段
 
-先进入项目使用的 Isaac Lab Conda 环境，然后执行：
-
-```bash
-cd Wheel-Legged-Lab
-
-./scripts/rsl_rl/train_staged.sh
-```
-
-指定环境数量、设备和随机种子：
+完整训练：
 
 ```bash
 ./scripts/rsl_rl/train_staged.sh \
@@ -35,122 +41,104 @@ cd Wheel-Legged-Lab
   --seed 42
 ```
 
-只检查将要执行的命令，不启动训练：
+新增的 `--end-stage` 表示“最后一个实际训练并验收的阶段”，包含该阶段。
+例如只完成到轮端净空：
 
 ```bash
-./scripts/rsl_rl/train_staged.sh --dry-run
+./scripts/rsl_rl/train_staged.sh --end-stage clearance
 ```
 
-## 3. 从已经训练好的平地模型开始
+只检查命令和阶段范围，不启动训练：
 
-如果 `Wheel-Legged-Flat-v0` 已经达到要求，可以跳过第一阶段：
+```bash
+./scripts/rsl_rl/train_staged.sh --dry-run --end-stage target_landing
+```
+
+未提供 `--end-stage` 时默认训练到配置中的最后阶段 `obstacle_oracle`。
+
+## 3. 从已有 checkpoint 开始
+
+通用恢复入口由三个参数共同组成：
+
+- `--start-checkpoint`：模型文件；
+- `--start-stage`：该模型所属的阶段，不是准备进入的阶段；
+- `--start-mode continue|next`：继续当前阶段，或确认当前阶段已合格并进入下一阶段。
+
+例如从合格 Flat 模型直接进入 Jump Flat，并训练到 Clearance：
 
 ```bash
 ./scripts/rsl_rl/train_staged.sh \
   --start-checkpoint logs/rsl_rl/wheel_legged_flat/<run>/model_<iteration>.pt \
   --start-stage flat \
-  --start-mode next
+  --start-mode next \
+  --end-stage clearance
 ```
 
-流水线会自动调用 `expand_rsl_checkpoint_for_jump.py` 扩展 Actor、Critic
-和观测归一化器，并限制继承的探索标准差。不要直接把未转换的平地
-checkpoint 加载到跳跃任务。
+流水线会自动调用 `expand_rsl_checkpoint_for_jump.py` 扩展 Actor、Critic 和
+观测归一化器。旧参数 `--flat-checkpoint PATH` 仍兼容，等价于
+`flat + next`。
 
-原来的 `--flat-checkpoint PATH` 仍然可用，等价于以上三个参数。
+继续训练尚未达标的第六档障碍物模型：
 
-## 4. 从任意阶段继续或进入下一阶段
+```bash
+./scripts/rsl_rl/train_staged.sh \
+  --start-checkpoint \
+  logs/rsl_rl/wheel_legged_jump_obstacle_oracle_flat/<run>/model_400.pt \
+  --start-stage obstacle_oracle \
+  --start-mode continue \
+  --end-stage obstacle_oracle
+```
 
-通用恢复入口由三个参数共同组成：
-
-- `--start-checkpoint`：模型文件；
-- `--start-stage`：这个模型所属的阶段；
-- `--start-mode continue|next`：继续本阶段，或直接进入下一阶段。
-
-可用阶段名称依次为：
+所有合法阶段名依次为：
 
 ```text
-flat
-jump_flat
-high_landing
-clearance
-moving_curriculum
+flat, jump_flat, high_landing, clearance,
+moving_curriculum, target_landing, obstacle_oracle
 ```
 
-例如，已有一个表现较好的 `high_landing` 模型，希望继续强化当前阶段，
-达到门槛后再自动进入 `clearance`：
+`continue` 恢复网络、优化器和 iteration，并继续执行当前阶段验收；`next`
+只迁移 Actor/Critic，使用新优化器和新 iteration。`--end-stage` 不能早于
+实际开始训练的阶段。例如 `--start-stage clearance --start-mode next`
+实际从 `moving_curriculum` 开始，因此不能同时指定 `--end-stage clearance`。
+最终阶段 `obstacle_oracle` 后没有下一阶段，只能使用 `continue`。
 
-```bash
-./scripts/rsl_rl/train_staged.sh \
-  --start-checkpoint \
-  logs/rsl_rl/wheel_legged_jump_high_landing_flat/<run>/model_<iteration>.pt \
-  --start-stage high_landing \
-  --start-mode continue
-```
+## 4. 自动验收原则
 
-`continue` 会恢复 Actor、Critic、优化器和 iteration，且仍然执行当前
-阶段的自动验收；只有当前阶段达标后才进入后续阶段。它要求 checkpoint
-与所选阶段的任务、网络和观测维度一致。
+所有阶段使用最近 `20` 个 iteration 的滑动平均，并要求连续 `3` 次通过。
+相比原来的连续 `5` 次，这仍能过滤单次尖峰，但不容易因训练噪声长期卡住。
+每个阶段还保留最低训练轮数和多项联合条件，不能只靠单个成功率晋级。
 
-如果该模型已经通过 `high_landing` 的人工检查，希望跳过验收并直接训练
-`clearance`：
+当前主要门槛如下；完整机器可读配置位于
+`scripts/rsl_rl/staged_training_config.json`。
 
-```bash
-./scripts/rsl_rl/train_staged.sh \
-  --start-checkpoint \
-  logs/rsl_rl/wheel_legged_jump_high_landing_flat/<run>/model_<iteration>.pt \
-  --start-stage high_landing \
-  --start-mode next
-```
-
-`next` 会把 Actor/Critic 权重迁移至下一阶段，但使用新的优化器并从新的
-iteration 计数开始。选择 `next` 表示你已经确认来源阶段合格，流水线不会
-再次检查该阶段。最终阶段 `moving_curriculum` 后面没有阶段，因此它只能
-使用 `continue`。
-
-三个参数必须同时提供，防止 checkpoint 所属阶段不明确。示例中的
-`--start-stage` 指的是“模型来自哪个阶段”，而不是将要进入的阶段。
-
-## 5. 自动晋级原理
-
-每个阶段使用最近 `20` 个 iteration 的训练指标平均值，并要求连续
-`5` 次判断全部通过。还设置了最低训练轮数，防止迁移初期的偶然高值
-触发过早晋级。
-
-主要验收内容：
-
-| 阶段 | 核心条件 |
+| 阶段 | 主要训练态验收条件 |
 |---|---|
-| Flat | 速度课程达到 `1.0 m/s`、yaw 课程达到 `2.0 rad/s`，跟踪得分和安全指标合格 |
-| Jump Flat | 起跳速度、机身升高、滞空、成功率和恢复失败率合格 |
-| High Landing | `9 cm` 以上机身上升，并满足落速、柔和落地和恢复要求 |
-| Clearance | 轮端净空达到 `10 cm`，同时保持成功率与安全落地 |
-| Moving Curriculum | 到达课程第 4 档，即 `1.0 m/s`，并同时通过移动、跳跃、落地和航向指标 |
+| Flat | 速度档 `≥0.99 m/s`、yaw 档 `≥1.99 rad/s`、线速度得分 `≥0.85`、角速度得分 `≥0.79` |
+| Jump Flat | 起跳 `≥0.45 m/s`、机身上升 `≥0.055 m`、滞空 `≥0.125 s`、成功率 `≥0.62` |
+| High Landing | 上升 `≥0.085 m`、成功率 `≥0.42`、柔落率 `≥0.70`、平均落速绝对值 `≤1.0 m/s` |
+| Clearance | 轮端净空 `≥0.095 m`、成功率 `≥0.60`、柔落率 `≥0.75` |
+| Moving Curriculum | 到第 4 档、移动得分 `≥0.75`、课程成功 `≥0.70`、柔落 `≥0.75`、航向 `≥0.76` |
+| Target Landing | 成功率 `≥0.50`、落点成功 `≥0.68`、平均落点误差 `≤0.045 m`、柔落 `≥0.65` |
+| Obstacle Oracle | 到第 6 档、课程成功 `≥0.45`、课程跨越 `≥0.75`、课程碰撞 `≤0.28`；累计成功 `≥0.40`、跨越 `≥0.70`、碰撞 `≤0.30` |
 
-完整数值位于：
+各阶段仍检查 `torque_saturation ≤ 0.05`，跳跃阶段也保留恢复失败率限制。
+这些是带探索噪声的训练态自动切换门槛，不等于最终确定性 Play 验收值。
+障碍物门槛依据 2026-07-31 第 6 档日志校准：`O课成功≈0.48`、
+`O课跨越≈0.79`、`O课碰撞≈0.25`、累计 `O成功≈0.42`。因此自动门槛允许
+正常波动，但没有取消真实跨越、碰撞和安全条件。
 
-```text
-scripts/rsl_rl/staged_training_config.json
-```
+## 5. Checkpoint 迁移
 
-这些是带探索噪声的训练态门槛，不等于确定性 Play 的验收值。例如历史
-C1 训练日志中的 `jump_success_rate` 可能只有约 `0.49`，但对应的
-确定性 Play 表现更高，因此 C1 默认训练门槛设置为 `0.45`，同时要求
-高度、落速、柔落和恢复指标共同通过。不要仅把该数值单独理解为最终
-成功率要求。
+- Flat → Jump Flat：自动扩展跳跃观测输入，再只加载网络权重。
+- Jump Flat → Target Landing：观测和动作维度一致，直接迁移权重。
+- Target Landing → Obstacle Oracle：障碍物观测多 10 维前向扫描；
+  `train.py` 在 `--load_weights_only` 时自动扩展 checkpoint 输入层。
+- 每次跨任务迁移使用新优化器，避免沿用上一奖励分布的 Adam 动量。
+- `continue` 同阶段恢复不会执行权重-only迁移，而是恢复完整训练状态。
 
-## 6. Checkpoint 如何迁移
+## 6. 日志、停止范围和失败保护
 
-- Flat → Jump Flat：先扩展输入维度，再只加载 Actor/Critic 权重。
-- 后续阶段：观测和动作维度相同，直接只加载 Actor/Critic 权重。
-- 每次切换任务都会使用新的优化器和新的 iteration 计数。
-- 最终移动任务仍从课程第 0 档开始，环境内部自动晋级到第 4 档。
-
-`--load_weights_only` 是有意设置的。不同阶段奖励分布发生变化，沿用上一
-阶段的 Adam 动量容易在新阶段产生过大的早期更新。
-
-## 7. 日志与失败保护
-
-每次运行会建立：
+每次运行建立：
 
 ```text
 logs/rsl_rl/staged_pipeline/<timestamp>/
@@ -158,28 +146,21 @@ logs/rsl_rl/staged_pipeline/<timestamp>/
 
 其中包括：
 
-- `state.json`：已完成阶段、每阶段 checkpoint 和最终 checkpoint；
+- `state.json`：`first_training_stage`、`end_stage`、已完成阶段和 checkpoint；
 - `*_gate.json`：该阶段实际使用的门槛；
 - `*_status.json`：停止时的滑动平均指标；
-- `model_flat_jump_init.pt`：转换后的平地初始化模型。
+- `model_flat_jump_init.pt`：需要时生成的 Flat→Jump 转换模型。
 
-每个任务的完整训练日志仍保存在原来的 `logs/rsl_rl/<experiment>/`
-目录。
+当请求区间全部通过时，`state.json` 中 `passed=true` 表示“指定的开始/结束
+区间已经完成”，不一定表示七阶段全部完成。若某阶段用完最大 iteration 仍
+未通过，流水线立即返回非零状态并保留 checkpoint，不会把未达标模型迁移到
+更困难阶段。
 
-如果某阶段用完最大 iteration 后仍未通过，流水线返回非零状态并停止，
-同时保留该阶段最终 checkpoint 和状态文件。这样不会把尚未掌握当前
-能力的模型自动传到更困难的任务。
+## 7. 调整原则
 
-## 8. 调整原则
+自动门槛用于可靠切换阶段，而不是替代最终 Play 验收。建议：
 
-优先调整每阶段的 `max_iterations`，不要为了让流水线“通过”就明显降低
-所有门槛。只有在多次训练都稳定卡在同一指标、并且确定性 Play 已经证实
-能力合格时，才根据训练态与 Play 的系统偏差调整对应规则。
-
-建议保留以下硬性安全条件：
-
-- `torque_saturation` 不长期出现；
-- `jump_fail_recovery_rate` 接近零；
-- 高跳阶段必须同时检查高度和落速；
-- 净空阶段必须检查真实 `jump_wheel_clearance`，不能用机身高度替代；
-- 最终阶段必须同时检查课程档位、移动跟踪、跳跃成功、柔和落地和航向。
+- 不因成功率波动而取消 `torque_saturation`、恢复失败、真实轮端净空等安全条件；
+- 障碍物阶段同时检查课程窗口和累计指标，避免某个短窗口偶然通过；
+- 若确定性 Play 已合格而训练态只差少量，可按日志分布微调对应门槛；
+- 若碰撞或净空不合格，应改奖励、动作时序或课程，而不是继续降低最终成功定义。

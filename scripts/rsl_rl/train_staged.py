@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run the complete flat-to-moving-jump RSL-RL training pipeline."""
+"""Run a selectable interval of the flat-to-obstacle RSL-RL pipeline."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = Path(__file__).with_name("staged_training_config.json")
-DEFAULT_ISAACLAB = PROJECT_ROOT.parents[1] / "IsaacLab"
+DEFAULT_ISAACLAB = PROJECT_ROOT.parent / "IsaacLab"
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,8 +37,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Stage that produced --start-checkpoint, for example flat, "
-            "jump_flat, high_landing, clearance, or moving_curriculum."
+            "Stage that produced --start-checkpoint. Valid names are read from "
+            "staged_training_config.json."
+        ),
+    )
+    parser.add_argument(
+        "--end-stage",
+        type=str,
+        default=None,
+        help=(
+            "Last stage to train and validate (inclusive). Defaults to the final "
+            "stage configured in staged_training_config.json."
         ),
     )
     parser.add_argument(
@@ -212,9 +221,6 @@ def main() -> int:
         "completed": [],
         "passed": False,
     }
-    if not args.dry_run:
-        write_json(state_dir / "state.json", state)
-
     (
         previous_checkpoint,
         first_stage_index,
@@ -222,6 +228,27 @@ def main() -> int:
         source_stage_name,
         start_mode,
     ) = resolve_start_request(args, stages)
+    stage_names = [str(stage["name"]) for stage in stages]
+    if args.end_stage is None:
+        end_stage_index = len(stages) - 1
+    elif args.end_stage not in stage_names:
+        raise ValueError(
+            f"Unknown --end-stage {args.end_stage!r}; choose one of: "
+            + ", ".join(stage_names)
+        )
+    else:
+        end_stage_index = stage_names.index(args.end_stage)
+    if end_stage_index < first_stage_index:
+        raise ValueError(
+            f"--end-stage {stage_names[end_stage_index]!r} is earlier than the "
+            f"first stage that would actually train, {stage_names[first_stage_index]!r}."
+        )
+    end_stage_name = stage_names[end_stage_index]
+    state["first_training_stage"] = stage_names[first_stage_index]
+    state["end_stage"] = end_stage_name
+    if not args.dry_run:
+        write_json(state_dir / "state.json", state)
+
     if previous_checkpoint is not None:
         source_checkpoint = previous_checkpoint
         already_converted = is_jump_init_checkpoint(source_checkpoint)
@@ -269,6 +296,8 @@ def main() -> int:
     for index, stage in enumerate(stages):
         if index < first_stage_index:
             continue
+        if index > end_stage_index:
+            break
 
         stage_name = stage["name"]
         run_name = f"auto_{pipeline_id}_{stage_name}"
@@ -343,7 +372,7 @@ def main() -> int:
         previous_checkpoint = checkpoint
         resume_first_stage = False
 
-        if stage_name == "flat":
+        if stage_name == "flat" and index < end_stage_index:
             converted = state_dir / "model_flat_jump_init.pt"
             conversion_command = [
                 str(isaaclab_sh),
@@ -366,7 +395,9 @@ def main() -> int:
     state["final_checkpoint"] = str(previous_checkpoint)
     state.pop("active_stage", None)
     write_json(state_dir / "state.json", state)
-    print(f"\n[PIPELINE] All stages passed.")
+    print(
+        f"\n[PIPELINE] Requested stages passed through {end_stage_name!r}."
+    )
     print(f"[PIPELINE] Final checkpoint: {previous_checkpoint}")
     print(f"[PIPELINE] Pipeline record: {state_dir / 'state.json'}")
     return 0
