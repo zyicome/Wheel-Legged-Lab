@@ -832,3 +832,130 @@ python scripts/rsl_rl/play.py \
 ```
 
 不要添加 `--headless`；启动后先点击一次仿真 Viewport，使键盘焦点进入窗口。
+
+## 16. Stage D2：Oracle 实体障碍物细粒度课程与固定尺寸评估
+
+> 更新日期：2026-07-31
+
+任务 ID：
+
+```text
+Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0
+```
+
+### Play 为什么默认显示第 0 档
+
+RSL-RL checkpoint 保存 actor、critic、优化器等训练状态，但不会保存环境内部的
+障碍物课程档位。每次新建 Play 环境时，几何课程因此从配置中的
+`initial_level=0` 初始化。未指定固定尺寸时，日志显示：
+
+```text
+O高=0.0200 O宽=0.0350 O档=0
+```
+
+这是新环境的正常初始化结果，不表示加载的策略权重只能通过第 0 档。评估不同
+尺寸时不应依赖刚创建的课程自行晋级，而应显式指定障碍物高度和宽度。
+
+Play 新增两个参数：
+
+```text
+--obstacle_height HEIGHT   障碍物暴露高度，当前允许 0–0.08 m
+--obstacle_width WIDTH     沿行驶方向的障碍物宽度，必须大于 0
+```
+
+例如精确测试最终档 8 cm 高、8 cm 宽障碍物：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0 \
+  --checkpoint /absolute/path/to/obstacle_oracle/model_xxx.pt \
+  --num_envs 10 \
+  --command_range 0.75 \
+  --yaw_command_range 0.4 \
+  --obstacle_height 0.08 \
+  --obstacle_width 0.08
+```
+
+固定几何模式下，环境不再对所给高度或宽度进行课程随机化。紧凑日志使用
+`O档=-1` 标识手动固定尺寸，此时应以 `O高` 和 `O宽` 为准。只给出其中一个
+参数时，另一个维度仍采用新环境第 0 档的配置；正式对比测试建议两个参数同时
+给出。
+
+### 七档障碍物几何课程
+
+原来的 `2→4→6→8 cm` 四档课程在后两档同时提高高度和宽度，难度跃迁过大。
+当前课程拆分为七档：
+
+| `O档` | 随机高度上限 | 固定宽度 |
+|---:|---:|---:|
+| 0 | 0.02 m | 0.035 m |
+| 1 | 0.04 m | 0.035 m |
+| 2 | 0.05 m | 0.050 m |
+| 3 | 0.06 m | 0.050 m |
+| 4 | 0.07 m | 0.065 m |
+| 5 | 0.08 m | 0.065 m |
+| 6 | 0.08 m | 0.080 m |
+
+训练随机高度仍从“当前档上限以下 1 cm”到“当前档上限”采样，最低不小于
+2 cm。新表尽量避免一次晋级同时大幅增加高度和宽度：先形成轮端净空能力，
+再增加障碍物上方需要保持净空的时间。
+
+### 成功判定修正
+
+障碍物成功仍必须满足真实腾空、轮端越障净空、干净跨越、落点、姿态和速度
+恢复等条件。仅将机身上升比例门槛修改为：
+
+```python
+state.success_height_ratio = 0.40
+```
+
+该修改用于减少“轮腿已经通过收腿获得足够净空并跨过实体障碍物，但机身高度
+只差几毫米而被记为失败”的假阴性。它不会绕过碰撞、净空或落地条件，因此
+不能把真实碰撞误判为成功。
+
+### 最高档前恢复探索
+
+Stage D2 的 PPO 使用：
+
+```text
+entropy_coef = 1.5e-3
+min_action_std = 0.10
+max_action_std = 0.50
+```
+
+较高的熵奖励和动作标准差下限用于防止策略在前几档过早收敛，使其进入更高、
+更宽的障碍物档位后仍能探索新的起跳、收腿和落地动作。标准差上下限由训练
+脚本对 Oracle 障碍物任务默认安装，也可以用命令行显式覆盖。
+
+课程状态不会随模型恢复，因此不建议从已经在旧最高档退化后的
+`model_1799.pt` 继续。使用进入最高档前能力较稳定的 `model_1100.pt`，并从
+新课程第 3 档（6 cm 高上限、5 cm 宽）重新适应：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0 \
+  --headless \
+  --num_envs 4096 \
+  --load_checkpoint_path \
+  logs/rsl_rl/wheel_legged_jump_obstacle_oracle_flat/2026-07-31_12-15-58_obstacle_curriculum_relaxed_gate/model_1100.pt \
+  --load_weights_only \
+  --obstacle_initial_level 3 \
+  --min_action_std 0.10 \
+  --max_action_std 0.50 \
+  --run_name obstacle_curriculum_fine_7_levels
+```
+
+`--load_weights_only` 保留 actor/critic 能力，但重新创建优化器和 iteration
+计数；`--obstacle_initial_level 3` 则显式恢复环境课程起点。训练时应同时检查
+`O成功`、`O跨越`、`O碰撞` 和 `F性能`：成功定义修正后若 `F性能` 下降但碰撞
+仍高，说明剩余问题是真实越障能力，而不是统计口径。
+
+需要区分最终成功率和课程晋级门槛。最新第 5 档日志（约第 384--403 次
+迭代）中，`O跨越` 约为 `0.78--0.79`，`O碰撞` 约为 `0.21--0.25`，已经满足
+当前晋级的跨越和碰撞条件；但 `O成功` 约为 `0.34`，`O课成功` 约为
+`0.36--0.43`，说明完整跳跃成功仍受落地/恢复和无碰撞条件限制。因此本轮只
+将**课程晋级**的 `success_threshold` 从 `0.60` 放宽到 `0.45`，最终
+`O成功` 的物理判定不改变，`clear_threshold=0.75`、`collision_threshold=0.25`
+也不改变，并继续要求连续两个窗口通过。这样是放宽课程阻塞，而不是伪造
+成功率；如果后续 `O成功` 仍长期低于 `0.40`，下一步应增加各个成功条件的
+失败分解统计，而不是继续盲目降低门槛。

@@ -71,6 +71,24 @@ parser.add_argument(
     help="Fix the forward landing-target distance in meters.",
 )
 parser.add_argument(
+    "--obstacle_height",
+    type=float,
+    default=None,
+    help=(
+        "Use one exact exposed obstacle height in meters during Oracle obstacle "
+        "Play (supported range: 0.0 to 0.08)."
+    ),
+)
+parser.add_argument(
+    "--obstacle_width",
+    type=float,
+    default=None,
+    help=(
+        "Use one exact obstacle width in meters during Oracle obstacle Play "
+        "(must be positive)."
+    ),
+)
+parser.add_argument(
     "--print_interval",
     type=int,
     default=100,
@@ -207,6 +225,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # stage's automatic velocity-to-distance coupling.
         env_cfg.commands.jump_command.couple_distance_to_velocity = False
         print(f"[INFO] Fixed jump target distance: {jump_distance:.3f} m")
+    if args_cli.obstacle_height is not None or args_cli.obstacle_width is not None:
+        obstacle_cfg = getattr(env_cfg, "obstacle_oracle", None)
+        if obstacle_cfg is None:
+            raise ValueError(
+                "--obstacle_height/--obstacle_width require "
+                "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0."
+            )
+        if args_cli.obstacle_height is not None:
+            obstacle_height = float(args_cli.obstacle_height)
+            if not 0.0 <= obstacle_height <= obstacle_cfg.obstacle_max_height:
+                raise ValueError(
+                    "--obstacle_height must be in [0.0, "
+                    f"{obstacle_cfg.obstacle_max_height:.3f}] m."
+                )
+            obstacle_cfg.fixed_height = obstacle_height
+        if args_cli.obstacle_width is not None:
+            obstacle_width = float(args_cli.obstacle_width)
+            if obstacle_width <= 0.0:
+                raise ValueError("--obstacle_width must be positive.")
+            obstacle_cfg.fixed_width = obstacle_width
+        shown_height = (
+            f"{obstacle_cfg.fixed_height:.3f} m"
+            if obstacle_cfg.fixed_height is not None
+            else "curriculum level 0"
+        )
+        shown_width = (
+            f"{obstacle_cfg.fixed_width:.3f} m"
+            if obstacle_cfg.fixed_width is not None
+            else "curriculum level 0"
+        )
+        print(
+            "[INFO] Oracle obstacle Play geometry: "
+            f"height={shown_height}, width={shown_width}."
+        )
     if hasattr(env_cfg, "curriculum") and hasattr(env_cfg.curriculum, "command_levels"):
         env_cfg.curriculum.command_levels = None
     if hasattr(env_cfg, "curriculum") and hasattr(env_cfg.curriculum, "speed_levels"):

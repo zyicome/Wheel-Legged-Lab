@@ -71,6 +71,17 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--obstacle_initial_level",
+    type=int,
+    default=None,
+    choices=range(7),
+    metavar="{0,1,2,3,4,5,6}",
+    help=(
+        "Initial obstacle geometry curriculum level. The seven levels end at "
+        "0.08 m height and 0.08 m width."
+    ),
+)
+parser.add_argument(
     "--early_stop_config",
     type=str,
     default=None,
@@ -324,6 +335,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "[INFO] Moving-jump curriculum starts at level "
             f"{args_cli.moving_jump_initial_level}."
         )
+    if args_cli.obstacle_initial_level is not None:
+        curriculum_cfg = getattr(env_cfg, "curriculum", None)
+        geometry_term_cfg = (
+            getattr(curriculum_cfg, "geometry_levels", None)
+            if curriculum_cfg is not None
+            else None
+        )
+        if geometry_term_cfg is None:
+            raise ValueError(
+                "--obstacle_initial_level requires the Oracle obstacle "
+                "geometry curriculum task."
+            )
+        geometry_term_cfg.params["initial_level"] = args_cli.obstacle_initial_level
+        print(
+            "[INFO] Obstacle geometry curriculum starts at level "
+            f"{args_cli.obstacle_initial_level}."
+        )
 
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
@@ -452,7 +480,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     min_action_std = args_cli.min_action_std
     max_action_std = args_cli.max_action_std
-    if args_cli.task and args_cli.task.startswith("Wheel-Legged-Jump-"):
+    if args_cli.task == "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0":
+        min_action_std = 0.10 if min_action_std is None else min_action_std
+        max_action_std = 0.50 if max_action_std is None else max_action_std
+    elif args_cli.task and args_cli.task.startswith("Wheel-Legged-Jump-"):
         min_action_std = 0.05 if min_action_std is None else min_action_std
         max_action_std = 0.50 if max_action_std is None else max_action_std
     if min_action_std is not None or max_action_std is not None:

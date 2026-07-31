@@ -132,10 +132,22 @@ class ObstacleOracleCfg:
 
     spawn_distance: float = 0.90
     obstacle_width: float = 0.035
-    obstacle_width_levels: tuple[float, ...] = (0.035, 0.050, 0.065, 0.080)
+    obstacle_width_levels: tuple[float, ...] = (
+        0.035,
+        0.035,
+        0.050,
+        0.050,
+        0.065,
+        0.065,
+        0.080,
+    )
     obstacle_lateral_size: float = 1.00
     obstacle_max_height: float = 0.08
     obstacle_height_range: tuple[float, float] = (0.02, 0.04)
+    # Optional exact geometry used by Play/evaluation. ``None`` keeps the
+    # training curriculum active; explicit values bypass its random range.
+    fixed_height: float | None = None
+    fixed_width: float | None = None
     preparation_time: float = 0.44
     takeoff_margin: float = 0.03
     landing_margin: float = 0.04
@@ -782,19 +794,41 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
         forward_w = quat_apply(self._robot.data.root_quat_w[env_ids], forward_b)
         yaw = torch.atan2(forward_w[:, 1], forward_w[:, 0])
         forward_xy = torch.stack((torch.cos(yaw), torch.sin(yaw)), dim=1)
-        level = int(getattr(self, "_obstacle_curriculum_level", 0))
+        geometry_term = getattr(self.cfg.curriculum, "geometry_levels", None)
+        geometry_params = getattr(geometry_term, "params", {})
+        initial_level = int(geometry_params.get("initial_level", 0))
+        level = int(
+            getattr(self, "_obstacle_curriculum_level", initial_level)
+        )
+        configured_height_levels = geometry_params.get(
+            "height_levels", (cfg.obstacle_height_range[1],)
+        )
         height_levels = getattr(
-            self, "_obstacle_height_levels", (cfg.obstacle_height_range[1],)
+            self, "_obstacle_height_levels", configured_height_levels
         )
         level = min(level, len(height_levels) - 1)
-        height_top = float(height_levels[level])
-        height_low = max(0.02, height_top - 0.01)
-        height = torch.empty(len(env_ids), device=self.device).uniform_(
-            height_low, height_top
-        )
-        width = float(
-            getattr(self, "_obstacle_width_levels", cfg.obstacle_width_levels)[level]
-        )
+        if cfg.fixed_height is None:
+            height_top = float(height_levels[level])
+            height_low = max(0.02, height_top - 0.01)
+            height = torch.empty(len(env_ids), device=self.device).uniform_(
+                height_low, height_top
+            )
+        else:
+            height = torch.full(
+                (len(env_ids),), float(cfg.fixed_height), device=self.device
+            )
+        if cfg.fixed_width is None:
+            width = float(
+                getattr(
+                    self,
+                    "_obstacle_width_levels",
+                    geometry_params.get(
+                        "width_levels", cfg.obstacle_width_levels
+                    ),
+                )[level]
+            )
+        else:
+            width = float(cfg.fixed_width)
         scales = torch.ones((len(env_ids), 3), device=self.device)
         scales[:, 0] = width / cfg.obstacle_width
         self._obstacle_xform.set_scales(scales, indices=env_ids)
@@ -990,8 +1024,16 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
         finite = torch.isfinite(self.obstacle_min_clearance)
         log["obstacle_height"] = self.obstacle_height.mean().item()
         log["obstacle_width"] = self.obstacle_width.mean().item()
-        log["obstacle_curriculum_level"] = float(
-            getattr(self, "_obstacle_curriculum_level", 0)
+        fixed_geometry = (
+            self.cfg.obstacle_oracle.fixed_height is not None
+            or self.cfg.obstacle_oracle.fixed_width is not None
+        )
+        # ``-1`` makes manual Play geometry distinguishable from curriculum
+        # level 0 in the compact O档 diagnostic.
+        log["obstacle_curriculum_level"] = (
+            -1.0
+            if fixed_geometry
+            else float(getattr(self, "_obstacle_curriculum_level", 0))
         )
         if hasattr(self, "_obstacle_curriculum_last_success"):
             log["obstacle_curriculum_success"] = (
@@ -1814,19 +1856,25 @@ class WheelLeggedObstacleOracleRewardsCfg(WheelLeggedTargetLandingRewardsCfg):
 
 @configclass
 class WheelLeggedObstacleGeometryCurriculumCfg:
-    """Joint 2→4→6→8 cm height and narrow→wide barrier curriculum."""
+    """Fine-grained height/width curriculum for reliable 8 cm barriers."""
 
     geometry_levels = CurriculumTermCfg(
         func=mdp.obstacle_geometry_curriculum,
         params={
-            "height_levels": (0.02, 0.04, 0.06, 0.08),
-            "width_levels": (0.035, 0.050, 0.065, 0.080),
+            # Height and width are not increased aggressively at the same
+            # transition. This provides intermediate gradients before the final
+            # 8 cm high × 8 cm wide barrier.
+            "height_levels": (0.02, 0.04, 0.05, 0.06, 0.07, 0.08, 0.08),
+            "width_levels": (0.035, 0.035, 0.050, 0.050, 0.065, 0.065, 0.080),
             "initial_level": 0,
-            "success_threshold": 0.60,
+            # The final O成功 metric remains strict; this lower value only
+            # prevents a good-crossing/high-collision-improving policy from
+            # being held at one level by a few landing/recovery failures.
+            "success_threshold": 0.45,
             "clear_threshold": 0.75,
             # This is an advancement gate, not the final acceptance target.
-            # Level 0 already clears reliably, but requiring <=10% wheel
-            # contact keeps it overfitting the 2 cm barrier indefinitely.
+            # Level 0 already clears reliably, but requiring <=25% wheel
+            # contact keeps it from advancing on crossings that still collide.
             "collision_threshold": 0.25,
             "min_trials": 1024,
             "consecutive_passes": 2,
@@ -1883,7 +1931,7 @@ class WheelLeggedObstacleOracleFlatEnvCfg(WheelLeggedTargetLandingFlatEnvCfg):
         state.start_max_speed = 0.90
         # Obstacle success is defined primarily by actual wheel clearance,
         # clean crossing, air time and landing. Retraction can produce useful
-        # wheel clearance without raising the base by 75% of the command.
-        state.success_height_ratio = 0.50
+        # wheel clearance without raising the base by 50% of the command.
+        state.success_height_ratio = 0.40
         state.success_max_recovery_vx_error = 0.18
         state.success_max_landing_position_error = 0.05

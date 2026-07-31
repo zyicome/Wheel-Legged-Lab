@@ -321,15 +321,34 @@ logs/rsl_rl/wheel_legged_flat/<timestamp>_<run_name>/
 ### 训练 Oracle 障碍物阶段
 
 `Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0` 在每个环境中放置一个横跨行驶
-方向的刚性障碍物。第一阶段随机暴露高度为 2–4 cm、宽度为 3.5 cm，环境根据
-障碍物距离和当前速度解析计算触发时机：
+方向的刚性障碍物。环境根据障碍物距离和当前速度解析计算触发时机：
 
 ```text
-trigger_distance = |vx_command| × 0.44 s + 0.03 m
+trigger_distance = |vx_command| × 0.44 s + takeoff_margin + 0.5 × wheel_radius
 ```
 
-低层策略不需要新增障碍物观测，仍接收原来的 48 维跳跃输入，因此可以直接迁移
-目标落点模型：
+策略在原 48 维跳跃输入后增加 10 维机器人前向高度扫描。训练脚本在从旧的
+目标落点 checkpoint 迁移时会自动扩展 actor/critic 的第一层输入，新增列保持
+随机初始化，其余权重原样加载。
+
+当前障碍物几何课程细分为 7 档；每档高度表示随机暴露高度的上限：
+
+| `O档` | 高度上限 | 宽度 |
+|---:|---:|---:|
+| 0 | 0.02 m | 0.035 m |
+| 1 | 0.04 m | 0.035 m |
+| 2 | 0.05 m | 0.050 m |
+| 3 | 0.06 m | 0.050 m |
+| 4 | 0.07 m | 0.065 m |
+| 5 | 0.08 m | 0.065 m |
+| 6 | 0.08 m | 0.080 m |
+
+高度和宽度不再在同一次晋级中同时大幅增加，以便策略先适应更高的轮端净空，
+再适应更宽障碍物。障碍物成功判定仍要求真实腾空、轮端净空、干净跨越、
+落点和恢复速度，但机身上升比例门槛由 `0.50` 调整为 `0.40`，避免已经通过
+收腿获得真实净空的样本只因机身高度相差几毫米而被判为失败。
+
+从目标落点模型开始训练：
 
 ```bash
 "${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
@@ -338,20 +357,59 @@ trigger_distance = |vx_command| × 0.44 s + 0.03 m
   --num_envs 4096 \
   --load_checkpoint_path /absolute/path/to/target_landing/model_xxx.pt \
   --load_weights_only \
-  --run_name obstacle_oracle_low
+  --run_name obstacle_oracle_curriculum
 ```
 
-第一阶段接近速度限制为 0.45–0.75 m/s。训练时重点观察：
+障碍物阶段默认把动作探索标准差限制在 `0.10–0.50`，PPO 熵系数为
+`1.5e-3`。如需显式覆盖，仍可传入：
+
+```text
+--min_action_std 0.10 --max_action_std 0.50
+```
+
+从已有障碍物模型继续训练时，课程状态不会保存在 checkpoint 中。使用
+`--obstacle_initial_level` 指定恢复档位。例如旧课程进入最高档前的
+`model_1100.pt` 对应约 5–6 cm 高、6.5 cm 宽的成熟能力，建议从新课程第 3 档
+重新适应，再逐步晋级：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0 \
+  --headless \
+  --num_envs 4096 \
+  --load_checkpoint_path \
+  logs/rsl_rl/wheel_legged_jump_obstacle_oracle_flat/2026-07-31_12-15-58_obstacle_curriculum_relaxed_gate/model_1100.pt \
+  --load_weights_only \
+  --obstacle_initial_level 3 \
+  --min_action_std 0.10 \
+  --max_action_std 0.50 \
+  --run_name obstacle_curriculum_fine_7_levels
+```
+
+训练时重点观察：
 
 ```text
 O触发误差  趋近 0
-O净空      最终大于 0.015 m
-O跨越      最终大于 0.80
-O碰撞      最终小于 0.03
-O成功      最终大于 0.70
+O净空      最终大于 0.025 m
+O跨越      最终大于 0.85，目标大于 0.90
+O碰撞      先降到 0.15 以下，最终目标小于 0.08
+O成功      先达到 0.55，最终目标大于 0.70
+F性能      随成功定义修正后应明显下降
 ```
 
-使用训练后的模型进行自动越障 Play：
+注意：`O课成功` 是课程晋级门槛，`O成功` 是严格的单次障碍物成功率，两者
+不是同一个指标。当前课程晋级门槛从 `0.60` 临时放宽到 `0.45`，但没有放宽
+实体碰撞、跨越、净空、滞空、落地和速度恢复等最终成功条件；`O课跨越` 仍需
+达到 `0.75`，`O课碰撞` 仍需不超过 `0.25`，并连续两个统计窗口通过。这样
+只允许“跨越和碰撞已经稳定、少量落地/恢复失败”的策略继续学习，不会把
+`O成功` 直接改成虚高的成功率。
+
+#### Play 中手动指定障碍物尺寸
+
+Play 不恢复训练时的课程状态；没有显式参数时会从第 0 档开始，因此看到
+`O高=0.0200 O宽=0.0350 O档=0` 是正常现象。可以使用
+`--obstacle_height` 和 `--obstacle_width` 设置所有 Play 环境中的精确尺寸。
+例如测试最终 8 cm × 8 cm 障碍物：
 
 ```bash
 "${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
@@ -359,8 +417,29 @@ O成功      最终大于 0.70
   --checkpoint /absolute/path/to/obstacle_oracle/model_xxx.pt \
   --num_envs 10 \
   --command_range 0.75 \
-  --yaw_command_range 0.4
+  --yaw_command_range 0.4 \
+  --obstacle_height 0.08 \
+  --obstacle_width 0.08
 ```
+
+也可以测试中间尺寸：
+
+```bash
+# 精确测试 6 cm 高、6.5 cm 宽
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0 \
+  --checkpoint /absolute/path/to/obstacle_oracle/model_xxx.pt \
+  --num_envs 10 \
+  --command_range 0.75 \
+  --yaw_command_range 0.4 \
+  --obstacle_height 0.06 \
+  --obstacle_width 0.065
+```
+
+固定几何测试时，紧凑日志使用 `O档=-1` 表示手动模式；此时以 `O高` 和
+`O宽` 为准。障碍物高度当前受实体最大高度限制，允许范围为 `0–0.08 m`；
+宽度必须大于零。Oracle 环境会根据所选几何自动计算跳跃高度和落点距离，
+因此一般不需要再传 `--jump_height` 或 `--jump_distance`。
 
 ### 一键完成全部阶段
 
@@ -524,7 +603,7 @@ tensorboard --logdir logs/rsl_rl --port 6006
 - [x] 发布可复现 checkpoint 与 TensorBoard 曲线；
 - [x] 增加平地目标落点命令与落点精度训练阶段；
 - [x] 增加低障碍物 Oracle 触发与实体碰撞训练阶段；
-- [ ] 增加障碍物高度/宽度课程与前向地形感知；
+- [x] 增加细粒度障碍物高度/宽度课程与前向高度扫描；
 - [ ] 从外部触发跳跃扩展到感知驱动的自主越障；
 - [ ] 加入多随机种子评估和自动回归测试；
 - [ ] 完成延迟、噪声、摩擦和电机参数随机化；

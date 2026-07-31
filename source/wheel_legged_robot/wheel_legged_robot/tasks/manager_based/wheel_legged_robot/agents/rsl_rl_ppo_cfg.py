@@ -143,3 +143,20 @@ class WheelLeggedObstacleOraclePPORunnerCfg(WheelLeggedTargetLandingPPORunnerCfg
     experiment_name = "wheel_legged_jump_obstacle_oracle_flat"
     max_iterations = 2400
     save_interval = 100
+    # The geometry curriculum introduces new takeoff/retraction solutions after
+    # the inherited policy has already converged. Keep more exploration than
+    # the earlier jump stages so the final obstacle levels can still adapt.
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=1.5e-3,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=2.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.008,
+        max_grad_norm=1.0,
+    )
