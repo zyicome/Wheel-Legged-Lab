@@ -30,6 +30,16 @@
 
 ## 演示、预训练模型与训练曲线
 
+### 最新效果：跨越 7 cm 高障碍物
+
+最新 Oracle 障碍物策略跨越 **7 cm 高实体障碍物**的仿真效果：
+
+![轮腿机器人跨越 7 cm 高障碍物](docs/media/obstacle_jump_7cm.gif)
+
+[查看高清 MP4 视频](docs/media/obstacle_jump_7cm.mp4)
+
+### 移动跳跃策略演示
+
 以下演示均使用最终移动跳跃策略 `model_844.pt`：
 
 ### 单环境测试
