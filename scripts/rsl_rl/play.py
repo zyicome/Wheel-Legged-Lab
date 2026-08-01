@@ -40,11 +40,49 @@ parser.add_argument(
     "--keyboard",
     action="store_true",
     default=False,
-    help="Control vx/wz/height from the keyboard; J triggers jump tasks.",
+    help="Control vx/wz/height; J triggers jumps and K toggles actuator power.",
+)
+parser.add_argument("--power_ramp_time", type=float, default=0.60)
+parser.add_argument("--power_extend_time", type=float, default=0.80)
+parser.add_argument("--power_stabilize_time", type=float, default=0.60)
+parser.add_argument("--power_handoff_time", type=float, default=1.00)
+parser.add_argument("--power_target_length", type=float, default=0.21)
+parser.add_argument(
+    "--power_restart_max_tilt",
+    type=float,
+    default=0.60,
+    help="Refuse K-key restart above this tilt in radians; this is not self-righting.",
+)
+parser.add_argument(
+    "--eval_pushes",
+    action="store_true",
+    default=False,
+    help=(
+        "Keep the task's periodic push event enabled during Play. Useful for "
+        "Recovery/Terrain evaluation; disabled by default for deterministic Play."
+    ),
 )
 parser.add_argument("--keyboard_height", type=float, default=0.21, help="Initial body height in keyboard mode.")
 parser.add_argument(
     "--keyboard_height_step", type=float, default=0.01, help="Body-height increment for each R/F key press."
+)
+parser.add_argument(
+    "--keyboard_terrain",
+    choices=("task", "flat", "slope", "stairs", "mixed"),
+    default="task",
+    help=(
+        "Terrain preset for keyboard testing: keep the task terrain, or replace "
+        "it with flat, slope, stairs, or mixed. Non-task presets require --keyboard."
+    ),
+)
+parser.add_argument(
+    "--keyboard_terrain_difficulty",
+    type=float,
+    default=0.5,
+    help=(
+        "Difficulty in [0, 1] for slope/stairs terrain. It controls slope angle "
+        "or stair height; default is a moderate setting."
+    ),
 )
 parser.add_argument(
     "--command_range",
@@ -100,6 +138,16 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
+for duration_name in (
+    "power_ramp_time",
+    "power_extend_time",
+    "power_stabilize_time",
+    "power_handoff_time",
+):
+    if getattr(args_cli, duration_name) <= 0.0:
+        parser.error(f"--{duration_name} must be positive.")
+if args_cli.power_restart_max_tilt <= 0.0:
+    parser.error("--power_restart_max_tilt must be positive.")
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -127,6 +175,9 @@ import gymnasium as gym
 import torch
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
+import isaaclab.terrains as terrain_gen
+from isaaclab.terrains import TerrainGeneratorCfg
+
 from isaaclab.envs import (
     DirectMARLEnv,
     DirectMARLEnvCfg,
@@ -152,6 +203,98 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import wheel_legged_robot.tasks  # noqa: F401
+from wheel_legged_robot.tasks.manager_based.wheel_legged_robot.mdp.power_on import (
+    PowerOnStandCfg,
+    PowerOnStandController,
+)
+
+
+
+def _configure_keyboard_terrain(env_cfg: ManagerBasedRLEnvCfg, terrain_name: str, difficulty: float) -> None:
+    """Replace the flat test plane with a small deterministic terrain island.
+
+    The training tasks remain unchanged: this helper is called only by Play and
+    is intended for one-robot interactive testing.  The center of every
+    generated terrain is a flat platform, so the robot starts safely and the
+    keyboard can drive it onto the slope or stairs.
+    """
+    if not 0.0 <= difficulty <= 1.0:
+        raise ValueError("--keyboard_terrain_difficulty must be in [0, 1].")
+    if terrain_name == "task":
+        print("[INFO] Keyboard test terrain: keep the task's configured terrain.")
+        return
+    if terrain_name == "flat":
+        env_cfg.scene.terrain.terrain_type = "plane"
+        env_cfg.scene.terrain.terrain_generator = None
+        print("[INFO] Keyboard test terrain: flat plane.")
+        return
+
+    # Keep the interactive test compact: one terrain island, a central safe
+    # platform, and enough room to approach the features from multiple sides.
+    slope_angle = 0.08 + 0.16 * difficulty
+    step_height = 0.025 + 0.035 * difficulty
+    if terrain_name == "slope":
+        sub_terrains = {
+            "slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+                proportion=1.0,
+                slope_range=(slope_angle, slope_angle),
+                platform_width=2.5,
+                border_width=0.35,
+            )
+        }
+    elif terrain_name == "stairs":
+        sub_terrains = {
+            "stairs": terrain_gen.HfPyramidStairsTerrainCfg(
+                proportion=1.0,
+                step_height_range=(step_height, step_height),
+                step_width=0.35,
+                platform_width=2.5,
+                border_width=0.35,
+            )
+        }
+    else:  # mixed
+        sub_terrains = {
+            "slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+                proportion=0.35,
+                slope_range=(slope_angle, slope_angle),
+                platform_width=2.5,
+                border_width=0.35,
+            ),
+            "stairs": terrain_gen.HfPyramidStairsTerrainCfg(
+                proportion=0.35,
+                step_height_range=(step_height, step_height),
+                step_width=0.35,
+                platform_width=2.5,
+                border_width=0.35,
+            ),
+            "rough": terrain_gen.HfRandomUniformTerrainCfg(
+                proportion=0.30,
+                noise_range=(0.01, 0.02 + 0.04 * difficulty),
+                noise_step=0.02,
+                border_width=0.35,
+            ),
+        }
+    generator = TerrainGeneratorCfg(
+        size=(12.0, 12.0),
+        border_width=2.0,
+        border_height=1.0,
+        num_rows=1,
+        num_cols=1,
+        curriculum=False,
+        horizontal_scale=0.05,
+        vertical_scale=0.005,
+        slope_threshold=0.75,
+        color_scheme="height",
+        use_cache=False,
+        sub_terrains=sub_terrains,
+    )
+    env_cfg.scene.terrain.terrain_type = "generator"
+    env_cfg.scene.terrain.terrain_generator = generator
+    print(
+        "[INFO] Keyboard test terrain: "
+        f"{terrain_name} (difficulty={difficulty:.2f}, "
+        f"slope={slope_angle:.3f} rad, step_height={step_height:.3f} m)."
+    )
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -180,12 +323,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.scene.terrain.terrain_generator.num_rows = 5
         env_cfg.scene.terrain.terrain_generator.num_cols = 5
         env_cfg.scene.terrain.terrain_generator.curriculum = False
+    if args_cli.keyboard_terrain != "task" and not args_cli.keyboard:
+        raise ValueError(
+            "--keyboard_terrain other than 'task' requires --keyboard so the "
+            "single-robot terrain test is not accidentally used for batch Play."
+        )
+    if args_cli.keyboard:
+        _configure_keyboard_terrain(
+            env_cfg,
+            args_cli.keyboard_terrain,
+            args_cli.keyboard_terrain_difficulty,
+        )
+
     if hasattr(env_cfg.observations, "policy"):
         env_cfg.observations.policy.enable_corruption = False
     if hasattr(env_cfg.events, "randomize_apply_external_force_torque"):
         env_cfg.events.randomize_apply_external_force_torque = None
-    if hasattr(env_cfg.events, "push_robot"):
+    if hasattr(env_cfg.events, "push_robot") and not args_cli.eval_pushes:
         env_cfg.events.push_robot = None
+    elif args_cli.eval_pushes and hasattr(env_cfg.events, "push_robot"):
+        push_cfg = env_cfg.events.push_robot
+        if push_cfg is None:
+            raise ValueError(
+                f"Task {task_name!r} does not configure a periodic push event."
+            )
+        print(
+            "[INFO] Periodic evaluation pushes enabled: "
+            f"interval={push_cfg.interval_range_s} s, "
+            f"max_push_vel_xy={push_cfg.params.get('max_push_vel_xy')}"
+        )
 
     if hasattr(env_cfg.commands, "wheel_legged_commands"):
         command_cfg = env_cfg.commands.wheel_legged_commands
@@ -268,8 +434,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     if args_cli.keyboard:
         env_cfg.scene.num_envs = 1
-        if hasattr(env_cfg.terminations, "time_out"):
-            env_cfg.terminations.time_out = None
+        # Interactive power loss must not be hidden by an automatic upright
+        # reset as the chassis settles. The user can still restart Play if the
+        # pose is outside the controller's recoverable range.
+        for termination_name in (
+            "time_out",
+            "bad_orientation",
+            "joint_limits",
+            "minimum_height",
+        ):
+            if hasattr(env_cfg.terminations, termination_name):
+                setattr(env_cfg.terminations, termination_name, None)
         command_cfg = env_cfg.commands.wheel_legged_commands
         command_cfg.heading_command = False
         command_cfg.resampling_time_range = (1.0e9, 1.0e9)
@@ -384,6 +559,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
+    vmc_term = env.unwrapped.action_manager.get_term("vmc")
+    power_mode = "on"
+    power_controller = None
+    power_contact_sensor = None
+    power_wheel_body_ids = None
+    if keyboard_controller is not None:
+        power_contact_sensor = env.unwrapped.scene.sensors["contact_forces"]
+        power_wheel_body_ids, _ = power_contact_sensor.find_bodies(".*wheel.*")
+        if len(power_wheel_body_ids) != 2:
+            raise RuntimeError("Keyboard power cycle requires exactly two wheel bodies.")
 
     # reset environment
     obs = env.get_observations()
@@ -395,12 +580,104 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         if keyboard_controller is not None:
             keyboard_controller.update()
+            if keyboard_controller.consume_power_cycle_request():
+                if power_mode == "off":
+                    gravity_b = env.unwrapped.scene["robot"].data.projected_gravity_b
+                    restart_tilt = torch.acos(
+                        torch.clamp(-gravity_b[:, 2], -1.0, 1.0)
+                    )
+                    wheel_forces = power_contact_sensor.data.net_forces_w[
+                        :, power_wheel_body_ids
+                    ]
+                    wheels_grounded = (
+                        torch.linalg.vector_norm(wheel_forces, dim=-1) > 2.0
+                    ).all(dim=1)
+                    if (
+                        bool(
+                            torch.any(
+                                restart_tilt > args_cli.power_restart_max_tilt
+                            ).item()
+                        )
+                        or not bool(torch.all(wheels_grounded).item())
+                    ):
+                        print(
+                            "[POWER] Restart refused: wait for both wheels to contact "
+                            "the ground and keep tilt below "
+                            f"{args_cli.power_restart_max_tilt:.2f} rad. "
+                            "A fully fallen robot requires Self-righting."
+                        )
+                        keyboard_controller.stop_commands(cancel_jump=True)
+                        obs = env.get_observations()
+                        continue
+                    power_controller = PowerOnStandController(
+                        env.unwrapped.num_envs,
+                        env.unwrapped.device,
+                        vmc_term.cfg,
+                        # One control frame captures the final passive geometry
+                        # before the actuator-output ramp begins.
+                        passive_durations=dt,
+                        cfg=PowerOnStandCfg(
+                            torque_ramp_time=args_cli.power_ramp_time,
+                            extend_time=args_cli.power_extend_time,
+                            stabilize_time=args_cli.power_stabilize_time,
+                            handoff_time=args_cli.power_handoff_time,
+                            target_leg_length=args_cli.power_target_length,
+                        ),
+                    )
+                    power_mode = "starting"
+                    print("[POWER] Restart requested: beginning safe power-on sequence.")
+                else:
+                    power_mode = "off"
+                    power_controller = None
+                    keyboard_controller.cancel_active_jump()
+                    vmc_term.reset()
+                    vmc_term.set_motor_enable_scale(0.0)
+                    reset_mask = torch.ones(
+                        env.unwrapped.num_envs,
+                        dtype=torch.bool,
+                        device=env.unwrapped.device,
+                    )
+                    if version.parse(installed_version) >= version.parse("4.0.0"):
+                        policy.reset(reset_mask)
+                    else:
+                        policy_nn.reset(reset_mask)
+                    print(
+                        "[POWER] Actuator output disabled. Press K again to restart."
+                    )
+            if power_mode != "on":
+                keyboard_controller.stop_commands(cancel_jump=True)
             # Make the new command visible to the policy in the same frame.
             obs = env.get_observations()
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            actions = policy(obs)
+            policy_actions = policy(obs)
+            if power_mode == "off":
+                actions = torch.zeros_like(policy_actions)
+                vmc_term.set_motor_enable_scale(0.0)
+            elif power_mode == "starting":
+                gravity_b = env.unwrapped.scene["robot"].data.projected_gravity_b
+                base_pitch = torch.atan2(gravity_b[:, 0], -gravity_b[:, 2])
+                base_pitch_rate = env.unwrapped.scene["robot"].data.root_ang_vel_b[:, 1]
+                actions, motor_scale, phase, handoff_started = power_controller.compute(
+                    env.unwrapped.L0,
+                    base_pitch=base_pitch,
+                    base_pitch_rate=base_pitch_rate,
+                    policy_actions=policy_actions,
+                )
+                if handoff_started.any():
+                    handoff_ids = handoff_started.nonzero(as_tuple=False).squeeze(-1)
+                    vmc_term.reset(handoff_ids)
+                vmc_term.set_motor_enable_scale(motor_scale)
+                power_controller.advance(dt)
+                if torch.all(phase == PowerOnStandController.COMPLETE):
+                    power_mode = "on"
+                    power_controller = None
+                    vmc_term.set_motor_enable_scale(1.0)
+                    print("[POWER] Policy handoff complete; keyboard control restored.")
+            else:
+                actions = policy_actions
+                vmc_term.set_motor_enable_scale(1.0)
             # env stepping
             obs, _, dones, extras = env.step(actions)
             # reset recurrent states for episodes that have terminated

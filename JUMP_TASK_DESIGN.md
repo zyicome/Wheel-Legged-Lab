@@ -833,6 +833,41 @@ python scripts/rsl_rl/play.py \
 
 不要添加 `--headless`；启动后先点击一次仿真 Viewport，使键盘焦点进入窗口。
 
+### 键盘复杂地形测试
+
+键盘 Play 现在支持单机器人测试地形，不会改动训练配置。使用：
+
+```text
+--keyboard_terrain {flat,slope,stairs,mixed}
+--keyboard_terrain_difficulty 0.0~1.0
+```
+
+- `flat`：原有平地，默认值；
+- `slope`：中心平台和四周斜坡；
+- `stairs`：中心平台和阶梯；
+- `mixed`：斜坡、阶梯和粗糙地面随机选一种；
+- 难度默认 `0.5`，控制斜坡角度和阶梯高度。
+
+复杂地形参数必须与 `--keyboard` 一起使用，避免在批量 Play 中误生成只有一个
+地形岛的场景。例如：
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Moving-Curriculum-Flat-v0 \
+  --checkpoint /absolute/path/to/model.pt \
+  --keyboard \
+  --keyboard_terrain stairs \
+  --keyboard_terrain_difficulty 0.5 \
+  --command_range 1.0 \
+  --yaw_command_range 1.2 \
+  --real-time
+```
+
+场景大小约为 `12 m × 12 m`，中央为安全平整出生平台。建议从难度 `0.3` 开始，
+确认机器人能够保持平衡并上下坡/阶梯后，再测试 `0.7~1.0`。这类测试主要用于
+观察平衡、速度保持、机身高度调节和跳跃恢复，不代表模型已经针对复杂地形训练
+完成；如果需要在复杂地形上稳定运行，应另建对应的训练环境和地形课程。
+
 ## 16. Stage D2：Oracle 实体障碍物细粒度课程与固定尺寸评估
 
 > 更新日期：2026-07-31

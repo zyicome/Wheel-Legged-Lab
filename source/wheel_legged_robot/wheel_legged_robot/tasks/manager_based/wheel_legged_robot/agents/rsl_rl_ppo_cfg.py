@@ -160,3 +160,56 @@ class WheelLeggedObstacleOraclePPORunnerCfg(WheelLeggedTargetLandingPPORunnerCfg
         desired_kl=0.008,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class WheelLeggedRecoveryPPORunnerCfg(WheelLeggedFlatPPORunnerCfg):
+    """PPO runner for near-fall recovery and disturbance rejection."""
+
+    experiment_name = "wheel_legged_recovery_flat"
+    max_iterations = 1800
+    save_interval = 100
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=1.0e-3,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=2.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+
+@configclass
+class WheelLeggedTerrainReactivePPORunnerCfg(WheelLeggedRecoveryPPORunnerCfg):
+    """PPO runner for proprioception-only mixed-terrain adaptation."""
+
+    experiment_name = "wheel_legged_terrain_reactive"
+    max_iterations = 2800
+    save_interval = 100
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=1.5e-3,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=2.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+
+@configclass
+class WheelLeggedTerrainPerceptivePPORunnerCfg(WheelLeggedTerrainReactivePPORunnerCfg):
+    """Optional actor-side terrain-scan branch."""
+
+    experiment_name = "wheel_legged_terrain_perceptive"

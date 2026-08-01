@@ -483,6 +483,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.task == "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0":
         min_action_std = 0.10 if min_action_std is None else min_action_std
         max_action_std = 0.50 if max_action_std is None else max_action_std
+    elif args_cli.task in (
+        "Wheel-Legged-Recovery-Flat-v0",
+        "Wheel-Legged-Terrain-Reactive-v0",
+        "Wheel-Legged-Terrain-Perceptive-v0",
+    ):
+        min_action_std = 0.08 if min_action_std is None else min_action_std
+        max_action_std = 0.50 if max_action_std is None else max_action_std
     elif args_cli.task and args_cli.task.startswith("Wheel-Legged-Jump-"):
         min_action_std = 0.05 if min_action_std is None else min_action_std
         max_action_std = 0.50 if max_action_std is None else max_action_std

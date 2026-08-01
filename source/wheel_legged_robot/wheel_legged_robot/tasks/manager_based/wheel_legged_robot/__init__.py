@@ -139,3 +139,48 @@ gym.register(
         ),
     },
 )
+
+
+gym.register(
+    id="Wheel-Legged-Recovery-Flat-v0",
+    entry_point=f"{__name__}.wheel_legged_terrain_env_cfg:WheelLeggedRobustEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.wheel_legged_terrain_env_cfg:WheelLeggedRecoveryFlatEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:WheelLeggedRecoveryPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Wheel-Legged-Terrain-Reactive-v0",
+    entry_point=f"{__name__}.wheel_legged_terrain_env_cfg:WheelLeggedRobustEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.wheel_legged_terrain_env_cfg:WheelLeggedTerrainReactiveEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:WheelLeggedTerrainReactivePPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Wheel-Legged-Terrain-Perceptive-v0",
+    entry_point=f"{__name__}.wheel_legged_terrain_env_cfg:WheelLeggedRobustEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.wheel_legged_terrain_env_cfg:WheelLeggedTerrainPerceptiveEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:WheelLeggedTerrainPerceptivePPORunnerCfg"
+        ),
+    },
+)

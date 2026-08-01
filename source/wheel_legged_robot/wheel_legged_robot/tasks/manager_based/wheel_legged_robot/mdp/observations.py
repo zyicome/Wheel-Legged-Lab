@@ -127,3 +127,72 @@ def restitution_coef(env) -> torch.Tensor:
         return env._restitution_coef.unsqueeze(-1)
     else:
         return torch.zeros(env.num_envs, 1, device=env.device) * 0.5
+
+
+def compact_height_scan(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    reference_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner_base"),
+    longitudinal_samples: int = 5,
+    lateral_samples: int = 3,
+) -> torch.Tensor:
+    """Return a compact forward terrain grid relative to ground under the body.
+
+    The full ray grid is reduced to ``longitudinal_samples × lateral_samples``
+    points while preserving its two-dimensional layout.  Positive values mean
+    terrain above the ground directly below the chassis.  This is deployable
+    with a depth/LiDAR preprocessing layer that emits the same local grid.
+    """
+    sensor = env.scene.sensors[sensor_cfg.name]
+    hits_z = sensor.data.ray_hits_w[..., 2]
+    valid = torch.isfinite(hits_z)
+    reference_sensor = env.scene.sensors[reference_sensor_cfg.name]
+    reference_hits = reference_sensor.data.ray_hits_w[..., 2]
+    reference_valid = torch.isfinite(reference_hits)
+    reference = torch.where(
+        reference_valid, reference_hits, torch.zeros_like(reference_hits)
+    ).sum(dim=1, keepdim=True) / reference_valid.sum(dim=1, keepdim=True).clamp(min=1)
+    relative = torch.where(valid, hits_z - reference, torch.zeros_like(hits_z))
+
+    pattern = sensor.cfg.pattern_cfg
+    nx = round(float(pattern.size[0]) / float(pattern.resolution)) + 1
+    ny = round(float(pattern.size[1]) / float(pattern.resolution)) + 1
+    sample_count = longitudinal_samples * lateral_samples
+    if nx * ny != relative.shape[1] or pattern.ordering != "xy":
+        indices = torch.linspace(
+            0, relative.shape[1] - 1, sample_count, device=env.device
+        ).round().long()
+        return relative.index_select(1, indices)
+
+    grid = relative.reshape(env.num_envs, ny, nx)
+    cache_key = (
+        sensor_cfg.name,
+        nx,
+        ny,
+        longitudinal_samples,
+        lateral_samples,
+    )
+    cache = getattr(env, "_compact_height_scan_index_cache", {})
+    if cache_key not in cache:
+        x_start = -0.5 * float(pattern.size[0]) + float(sensor.cfg.offset.pos[0])
+        x_end = 0.5 * float(pattern.size[0]) + float(sensor.cfg.offset.pos[0])
+        y_start = -0.5 * float(pattern.size[1]) + float(sensor.cfg.offset.pos[1])
+        y_end = 0.5 * float(pattern.size[1]) + float(sensor.cfg.offset.pos[1])
+        x = torch.linspace(x_start, x_end, nx, device=env.device)
+        y = torch.linspace(y_start, y_end, ny, device=env.device)
+        target_x = torch.linspace(
+            max(0.10, x_start), x_end, longitudinal_samples, device=env.device
+        )
+        lateral_extent = min(0.20, 0.5 * float(pattern.size[1]))
+        target_y = torch.linspace(
+            -lateral_extent, lateral_extent, lateral_samples, device=env.device
+        )
+        cache[cache_key] = (
+            (x[:, None] - target_x[None, :]).abs().argmin(dim=0),
+            (y[:, None] - target_y[None, :]).abs().argmin(dim=0),
+        )
+        env._compact_height_scan_index_cache = cache
+    x_indices, y_indices = cache[cache_key]
+    # Output order is near-to-far, and within each distance right/center/left.
+    sampled = grid[:, y_indices[:, None], x_indices[None, :]].transpose(1, 2)
+    return sampled.reshape(env.num_envs, sample_count)

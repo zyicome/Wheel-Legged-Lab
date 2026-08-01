@@ -4,6 +4,7 @@
 **/*.so
 **/*.log*
 **/jump_open_loop_results*
+**/power_on_stand_results*
 **/.vscode
 
 # Omniverse

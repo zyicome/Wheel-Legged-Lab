@@ -265,3 +265,23 @@ def soft_joint_limits_penalty(
     penalty_upper = torch.clamp(margin - upper_margin, min=0.0)
 
     return torch.sum(penalty_lower + penalty_upper, dim=1)
+
+
+def recovery_upright_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "wheel_legged_commands",
+    tilt_std: float = 0.30,
+    height_std: float = 0.07,
+    active_only: bool = True,
+) -> torch.Tensor:
+    """Reward returning to a commanded upright height after recoverable disturbances."""
+    gravity_b = env.scene["robot"].data.projected_gravity_b
+    tilt = torch.acos(torch.clamp(-gravity_b[:, 2], -1.0, 1.0))
+    target_height = env.command_manager.get_command(command_name)[:, 2]
+    height_error = env.base_height - target_height
+    reward = torch.exp(-torch.square(tilt / tilt_std)) * torch.exp(
+        -torch.square(height_error / height_std)
+    )
+    if active_only and hasattr(env, "_recovery_reward_mask"):
+        reward = reward * env._recovery_reward_mask
+    return reward

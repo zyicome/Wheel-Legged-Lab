@@ -120,7 +120,7 @@ def is_jump_init_checkpoint(path: Path) -> bool:
     """Return whether a checkpoint was already expanded for jump observations."""
     # This is the canonical output name used by this pipeline. Checking it first
     # keeps the lightweight orchestration script independent of PyTorch.
-    if path.name == "model_flat_jump_init.pt":
+    if path.name in {"model_flat_jump_init.pt", "model_pre_jump_init.pt"}:
         return True
 
     try:
@@ -252,14 +252,22 @@ def main() -> int:
     if previous_checkpoint is not None:
         source_checkpoint = previous_checkpoint
         already_converted = is_jump_init_checkpoint(source_checkpoint)
-        entering_jump_from_flat = source_stage_name == "flat" and start_mode == "next"
-        if source_stage_name == "flat" and start_mode == "continue" and already_converted:
+        source_stage = stages[stage_names.index(str(source_stage_name))]
+        entering_jump_from_base = (
+            bool(source_stage.get("convert_to_jump", False))
+            and start_mode == "next"
+        )
+        if (
+            bool(source_stage.get("convert_to_jump", False))
+            and start_mode == "continue"
+            and already_converted
+        ):
             raise ValueError(
-                "--start-mode continue for stage 'flat' requires an original Flat "
-                "checkpoint, not model_flat_jump_init.pt. Use --start-mode next for "
-                "the converted checkpoint."
+                f"--start-mode continue for stage {source_stage_name!r} requires "
+                "that stage's original checkpoint, not a checkpoint already "
+                "expanded for jump observations. Use --start-mode next instead."
             )
-        if entering_jump_from_flat:
+        if entering_jump_from_base:
             if already_converted:
                 print(
                     "\n[PIPELINE] The supplied checkpoint is already expanded for "
@@ -267,7 +275,7 @@ def main() -> int:
                     flush=True,
                 )
             else:
-                converted = state_dir / "model_flat_jump_init.pt"
+                converted = state_dir / "model_pre_jump_init.pt"
                 conversion_command = [
                     str(isaaclab_sh),
                     "-p",
@@ -278,7 +286,9 @@ def main() -> int:
                 ]
                 run_command(conversion_command, dry_run=args.dry_run)
                 previous_checkpoint = (
-                    Path("<converted-flat-checkpoint>") if args.dry_run else converted
+                    Path("<converted-pre-jump-checkpoint>")
+                    if args.dry_run
+                    else converted
                 )
         if not args.dry_run:
             state["start"] = {
@@ -288,8 +298,8 @@ def main() -> int:
                 "first_training_stage": stages[first_stage_index]["name"],
                 "full_state_resume": resume_first_stage,
             }
-            if entering_jump_from_flat:
-                state["flat_jump_checkpoint"] = str(previous_checkpoint)
+            if entering_jump_from_base:
+                state["pre_jump_checkpoint"] = str(previous_checkpoint)
                 state["source_checkpoint_already_converted"] = already_converted
             write_json(state_dir / "state.json", state)
 
@@ -340,6 +350,18 @@ def main() -> int:
         run_command(command, dry_run=args.dry_run)
         if args.dry_run:
             previous_checkpoint = Path(f"<checkpoint-from-{stage_name}>")
+            if bool(stage.get("convert_to_jump", False)) and index < end_stage_index:
+                converted = state_dir / "model_pre_jump_init.pt"
+                conversion_command = [
+                    str(isaaclab_sh),
+                    "-p",
+                    "scripts/expand_rsl_checkpoint_for_jump.py",
+                    str(previous_checkpoint),
+                    "--output",
+                    str(converted),
+                ]
+                run_command(conversion_command, dry_run=True)
+                previous_checkpoint = Path("<converted-pre-jump-checkpoint>")
             resume_first_stage = False
             continue
 
@@ -372,8 +394,8 @@ def main() -> int:
         previous_checkpoint = checkpoint
         resume_first_stage = False
 
-        if stage_name == "flat" and index < end_stage_index:
-            converted = state_dir / "model_flat_jump_init.pt"
+        if bool(stage.get("convert_to_jump", False)) and index < end_stage_index:
+            converted = state_dir / "model_pre_jump_init.pt"
             conversion_command = [
                 str(isaaclab_sh),
                 "-p",
@@ -382,10 +404,15 @@ def main() -> int:
                 "--output",
                 str(converted),
             ]
-            run_command(conversion_command, dry_run=False)
-            previous_checkpoint = converted
-            state["flat_jump_checkpoint"] = str(converted)
-            write_json(state_dir / "state.json", state)
+            run_command(conversion_command, dry_run=args.dry_run)
+            previous_checkpoint = (
+                Path("<converted-pre-jump-checkpoint>")
+                if args.dry_run
+                else converted
+            )
+            if not args.dry_run:
+                state["pre_jump_checkpoint"] = str(converted)
+                write_json(state_dir / "state.json", state)
 
     if args.dry_run:
         print("\n[PIPELINE] Dry run completed.")

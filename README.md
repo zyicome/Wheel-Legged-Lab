@@ -24,6 +24,7 @@
 - 平地模型到跳跃模型的观测维度迁移；
 - 按训练指标自动切换任务的一键分阶段训练；
 - Play 调试指标输出与键盘自由控制；
+- 无动力落地后的 VMC 力矩渐入、缓慢伸腿和策略平滑接管测试；
 - 跳跃开环物理能力测试。
 
 本项目仍是研究与学习性质的仿真工程，尚未完成真实机器人部署和系统性的 Sim-to-Real 验证。
@@ -162,6 +163,7 @@ Wheel-Legged-Lab/
 │       │   ├── curriculums.py       # 移动与移动跳跃课程
 │       │   ├── events.py            # 随机化与重置事件
 │       │   ├── jump.py              # 跳跃命令、观测和奖励
+│       │   ├── power_on.py          # 上电站立与策略交接状态机
 │       │   ├── observations.py      # 观测项
 │       │   └── rewards.py           # 平衡与移动奖励
 │       ├── wheel_legged_flat_env_cfg.py
@@ -173,7 +175,9 @@ Wheel-Legged-Lab/
 │   │   ├── train_staged.sh          # 一键分阶段训练入口
 │   │   └── staged_training_config.json
 │   ├── expand_rsl_checkpoint_for_jump.py
+│   ├── power_on_stand_open_loop_test.py
 │   └── jump_open_loop_test.py
+├── POWER_ON_STAND_TEST.md
 ├── JUMP_OPEN_LOOP_TEST_AND_TRAINING_PLAN.md
 ├── JUMP_TASK_DESIGN.md
 └── STAGED_TRAINING.md
@@ -277,6 +281,68 @@ export ISAACLAB_ROOT="/absolute/path/to/IsaacLab"
 logs/rsl_rl/wheel_legged_flat/<timestamp>_<run_name>/
 ```
 
+### 训练防摔恢复与复杂地形策略
+
+复杂地形控制仍然是命令条件策略：键盘或上层控制器提供 `vx`、`wz` 和机身
+高度，策略结合 IMU、关节、轮速等状态决定怎样稳定执行。它不会自行选择路线，
+因此加入地形感知不等于加入自主导航。
+
+推荐先从合格的平地 checkpoint 训练可恢复范围内的失衡和推撞：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Recovery-Flat-v0 \
+  --headless \
+  --num_envs 4096 \
+  --load_checkpoint_path /absolute/path/to/flat/model_xxx.pt \
+  --load_weights_only \
+  --run_name recovery
+```
+
+该任务覆盖约 `roll ±0.22 rad`、`pitch ±0.28 rad` 的初始失衡和周期性推撞，
+但不训练完全侧躺起立。`recovery_success_rate` 表示一次 reset/推撞后在 2.5 秒
+内重新达到姿态、高度和连续稳定时间要求的比例；它不是普通站立帧占比。
+
+随后训练不依赖前视传感器的反应式复杂地形策略：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Terrain-Reactive-v0 \
+  --headless \
+  --num_envs 4096 \
+  --load_checkpoint_path /absolute/path/to/recovery/model_xxx.pt \
+  --load_weights_only \
+  --run_name terrain_reactive
+```
+
+该课程混合缓坡、1.5–4.5 cm 阶梯和 0–3.5 cm 粗糙地面。档位根据一整个
+episode 内“沿命令方向实际行驶距离 / 命令要求距离”升降，前进后再后退不会
+因世界坐标净位移抵消而误判。
+
+如果实机计划安装深度相机、激光雷达或 ToF，可选用感知版。Actor 在相同本体
+观测后增加 `5 × 3 = 15` 个局部高度点（前方五个距离、左右三条扫描线）；
+`--load_weights_only` 会自动扩展旧 checkpoint 的输入层：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Terrain-Perceptive-v0 \
+  --headless \
+  --num_envs 4096 \
+  --load_checkpoint_path /absolute/path/to/terrain_reactive/model_xxx.pt \
+  --load_weights_only \
+  --run_name terrain_perceptive
+```
+
+实机部署时必须由真实传感器生成同样顺序和尺度的 15 维局部高度，不能直接依赖
+仿真真值。完整侧躺、趴倒或后仰后的起立应先验证机械行程和扭矩可行性，再作为
+独立 Recovery/Self-righting 策略训练，不与正常移动动作直接混合。
+
+当前一键流水线把 Reactive 地形能力作为 Jump Flat 的初始化，但后续跳跃阶段
+仍在平地训练，因此最终障碍物 checkpoint 不等价于“复杂地形移动跳跃模型”，
+也可能发生部分地形能力遗忘。若要把两者合并，应在地形移动稳定后新增独立的
+Jump-Terrain 联合微调阶段，并混入一定比例平地样本，而不是直接用 Perceptive
+checkpoint 加载现有 48 维跳跃任务。
+
 ### 单独训练一个跳跃阶段
 
 不同跳跃任务的观测维度一致，可以使用上一阶段 checkpoint 只迁移网络权重：
@@ -334,8 +400,16 @@ logs/rsl_rl/wheel_legged_flat/<timestamp>_<run_name>/
 方向的刚性障碍物。环境根据障碍物距离和当前速度解析计算触发时机：
 
 ```text
-trigger_distance = |vx_command| × 0.44 s + takeoff_margin + 0.5 × wheel_radius
+target_distance  = clamp(|vx_command| × 0.18 s, 0.08 m, 0.16 m)
+takeoff_standoff = clamp(target_distance - obstacle_width - 0.02 m,
+                         0.02 m, 0.07 m)
+trigger_distance = |vx_command| × 0.44 s + takeoff_standoff
 ```
+
+落点距离以实测约 `0.18 s` 滞空时间为依据，不再随触发后的剩余障碍物距离增长。
+这样即使策略在蹲伏或蹬伸阶段暂时减速，也不会得到 `0.25–0.30 m` 这类不可达
+落点。触发位置同时根据障碍物宽度调整，使速度目标、起跳位置和障碍物几何保持
+物理一致。
 
 策略在原 48 维跳跃输入后增加 10 维机器人前向高度扫描。训练脚本在从旧的
 目标落点 checkpoint 迁移时会自动扩展 actor/critic 的第一层输入，新增列保持
@@ -343,18 +417,19 @@ trigger_distance = |vx_command| × 0.44 s + takeoff_margin + 0.5 × wheel_radius
 
 当前障碍物几何课程细分为 7 档；每档高度表示随机暴露高度的上限：
 
-| `O档` | 高度上限 | 宽度 |
-|---:|---:|---:|
-| 0 | 0.02 m | 0.035 m |
-| 1 | 0.04 m | 0.035 m |
-| 2 | 0.05 m | 0.050 m |
-| 3 | 0.06 m | 0.050 m |
-| 4 | 0.07 m | 0.065 m |
-| 5 | 0.08 m | 0.065 m |
-| 6 | 0.08 m | 0.080 m |
+| `O档` | 高度上限 | 宽度 | 前进速度范围 |
+|---:|---:|---:|---:|
+| 0 | 0.02 m | 0.035 m | 0.45–0.60 m/s |
+| 1 | 0.04 m | 0.035 m | 0.45–0.65 m/s |
+| 2 | 0.05 m | 0.050 m | 0.50–0.65 m/s |
+| 3 | 0.06 m | 0.050 m | 0.50–0.70 m/s |
+| 4 | 0.07 m | 0.065 m | 0.60–0.75 m/s |
+| 5 | 0.08 m | 0.065 m | 0.60–0.75 m/s |
+| 6 | 0.08 m | 0.080 m | 0.70–0.75 m/s |
 
-高度和宽度不再在同一次晋级中同时大幅增加，以便策略先适应更高的轮端净空，
-再适应更宽障碍物。障碍物成功判定仍要求真实腾空、轮端净空、干净跨越、
+高度、宽度和速度范围共同晋级，避免低速命令与宽障碍物形成物理上不可完成的
+组合；同时也不在一次晋级中大幅增加所有难度。障碍物成功判定仍要求真实腾空、
+轮端净空、干净跨越、
 落点和恢复速度，但机身上升比例门槛由 `0.50` 调整为 `0.40`，避免已经通过
 收腿获得真实净空的样本只因机身高度相差几毫米而被判为失败。
 
@@ -453,10 +528,11 @@ Play 不恢复训练时的课程状态；没有显式参数时会从第 0 档开
 
 ### 一键完成全部阶段
 
-流水线现在覆盖七个阶段：
+流水线现在覆盖九个阶段：
 
 ```text
-flat → jump_flat → high_landing → clearance → moving_curriculum
+flat → recovery → terrain_reactive → jump_flat → high_landing
+     → clearance → moving_curriculum
      → target_landing → obstacle_oracle
 ```
 
@@ -500,8 +576,8 @@ flat → jump_flat → high_landing → clearance → moving_curriculum
 可用阶段名称为：
 
 ```text
-flat, jump_flat, high_landing, clearance,
-moving_curriculum, target_landing, obstacle_oracle
+flat, recovery, terrain_reactive, jump_flat, high_landing,
+clearance, moving_curriculum, target_landing, obstacle_oracle
 ```
 
 `--end-stage` 不能早于实际开始训练的阶段。最终 `obstacle_oracle` 后没有下一
@@ -546,12 +622,86 @@ Play 默认关闭观测噪声、地形课程、随机推力和命令课程，使
 
 启动后先点击一次 Isaac Sim Viewport，使窗口获得键盘焦点。
 
+键盘 Play 支持运行中电源循环：第一次按 `K` 会清零移动/跳跃命令、清除轮速
+积分并把 VMC 输出降为零；机器人会在重力下自然沉降。再次按 `K` 会执行
+`力矩渐入 → 伸腿扶正 → 稳定 → 当前策略接管`，完成后自动恢复键盘控制。
+启动过程中的命令会被强制保持为零，按键期间不要触发跳跃。
+
+默认键盘测试使用平地。现在可以通过 `--keyboard_terrain` 选择测试地形：
+
+| 参数 | 场景 |
+|---|---|
+| `flat` | 平地，默认值 |
+| `slope` | 中心平台加四周斜坡 |
+| `stairs` | 中心平台加阶梯 |
+| `mixed` | 随机选择斜坡、阶梯或粗糙地面 |
+
+复杂地形只用于单机器人键盘测试，因此必须同时添加 `--keyboard`。地形难度
+由 `--keyboard_terrain_difficulty 0~1` 控制，默认 `0.5`；难度越高，斜坡越陡、
+阶梯单级高度越大。训练环境和原有批量 Play 不会被修改。
+
+例如测试斜坡：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Moving-Curriculum-Flat-v0 \
+  --checkpoint /absolute/path/to/model.pt \
+  --keyboard \
+  --keyboard_terrain slope \
+  --keyboard_terrain_difficulty 0.5 \
+  --real-time \
+  --command_range 1.0 \
+  --yaw_command_range 1.2
+```
+
+测试阶梯或混合地形时，继续使用上面的 `isaaclab.sh` 命令，将参数替换为：
+
+```text
+--keyboard_terrain stairs
+--keyboard_terrain mixed
+```
+
+复杂地形会生成一个约 `12 m × 12 m` 的单独测试岛，机器人从中央平整平台
+出生，再由键盘控制其驶向斜坡、阶梯和粗糙区域。建议先用
+`--keyboard_terrain_difficulty 0.3` 熟悉场景，再逐步提高到 `0.7~1.0`。
+
+评估真正训练过的复杂地形模型时保留任务自身地形，不要用 Play 预设替换：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Terrain-Perceptive-v0 \
+  --checkpoint /absolute/path/to/terrain_perceptive/model_xxx.pt \
+  --keyboard \
+  --keyboard_terrain task \
+  --real-time \
+  --command_range 0.6 \
+  --yaw_command_range 1.2
+```
+
+此时方向、速度和停止仍由键盘决定；15 维地形输入只帮助底层策略提前调腿、
+减小撞击并保持平衡。
+
+Recovery/Reactive 的 Play 默认关闭随机推力。需要验证周期推撞恢复时显式添加
+`--eval_pushes`；Recovery 使用训练配置中的 `3~6 s` 推撞间隔，Reactive 使用
+`5~9 s`：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Recovery-Flat-v0 \
+  --checkpoint /absolute/path/to/recovery/model_xxx.pt \
+  --num_envs 50 \
+  --eval_pushes \
+  --command_range 0.6 \
+  --yaw_command_range 1.2
+```
+
 | 按键 | 功能 |
 |---|---|
 | `↑ / ↓` 或数字键盘 `8 / 2` | 前进 / 后退 |
 | `Z / X` 或数字键盘 `7 / 9` | 左转 / 右转 |
 | `R / F` | 升高 / 降低机身 |
 | `J` | 触发一次跳跃 |
+| `K` | 第一次断开电机输出；再次按下执行安全上电并交回策略 |
 | `L` | 清零移动命令并恢复默认高度 |
 
 空格键属于 Isaac Sim 的时间轴暂停快捷键，不用于跳跃。暂停并恢复后如果键盘没有响应，请确认时间轴正在播放，重新点击 Viewport，再按一次 `L` 清除残留按键状态。
@@ -565,6 +715,8 @@ tensorboard --logdir logs/rsl_rl --port 6006
 除了总奖励，建议重点观察：
 
 - 平移和航向跟踪误差；
+- `recovery_success_rate`、`recovery_failure_rate`、`recovery_mean_time`；
+- `terrain_level`、`terrain_tracking_ratio`；
 - `jump_takeoff_vz`、`jump_air_time`；
 - `jump_apex_rise`、`jump_wheel_clearance`；
 - `jump_success_rate`、`jump_soft_landing_rate`；
@@ -586,11 +738,36 @@ tensorboard --logdir logs/rsl_rl --port 6006
 
 脚本会并行扫描下蹲腿长、下蹲时间和蹬伸腿长，并把结果保存为 CSV 和 JSON。详细方法见 [JUMP_OPEN_LOOP_TEST_AND_TRAINING_PLAN.md](JUMP_OPEN_LOOP_TEST_AND_TRAINING_PLAN.md)。
 
+## 上电站立与策略接管测试
+
+真实机器人不应在控制程序启动瞬间直接输出完整 VMC 力矩。新增的确定性状态机
+按 `无动力沉降 → 力矩渐入 → 缓慢伸腿 → 稳定 → 策略接管` 执行，并支持并行
+扫描初始高度、倾角、腿部不对称和无动力等待时间：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/power_on_stand_open_loop_test.py \
+  --headless
+```
+
+如需验证与已有 Recovery/Locomotion 导出策略的平滑交接：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/power_on_stand_open_loop_test.py \
+  --policy /absolute/path/to/exported/policy.pt \
+  --headless
+```
+
+脚本不会训练 PPO，而是输出 `summary.csv`、`trace.csv` 和 `metadata.json`，用于
+判断站立成功率、稳定耗时、最大倾角/垂向速度、接触力、关节余量和力矩饱和。
+详细说明、最小冒烟命令和实机安全边界见
+[POWER_ON_STAND_TEST.md](POWER_ON_STAND_TEST.md)。
+
 ## 设计文档
 
 - [跳跃开环测试与训练路线](JUMP_OPEN_LOOP_TEST_AND_TRAINING_PLAN.md)
 - [跳跃状态机、奖励和阶段设计](JUMP_TASK_DESIGN.md)
 - [一键分阶段训练说明](STAGED_TRAINING.md)
+- [上电站立与策略接管测试](POWER_ON_STAND_TEST.md)
 
 这些文档保留了项目迭代过程中出现的问题、判断依据和训练经验。部分历史数值来自特定 checkpoint，不应被理解为所有机器人和随机种子都能直接达到的保证。
 
@@ -598,7 +775,8 @@ tensorboard --logdir logs/rsl_rl --port 6006
 
 - 尚未完成真实机器人部署；
 - 尚未系统验证传感器噪声、通信延迟和执行器热衰减；
-- 目前主要在平坦地面训练，尚未加入完整障碍物感知和自主起跳时机规划；
+- 已有反应式/局部感知复杂地形实验，但尚未完成真实传感器输入和系统性 Sim-to-Real 验证；
+- 完全侧躺自起立尚未验证机械可行性，也未并入正常移动策略；
 - 自动分阶段训练门槛来自当前机器人和已有训练日志，改变质量、尺寸、电机或奖励后需要重新校准；
 - 机器人模型来自 Wheel-Legged-Gym，相关 BSD 3-Clause 许可证与修改说明已随资产保留；
 - RSL-RL 是当前主要验证后端，CusRL 脚本仍属于实验性支持；
@@ -613,6 +791,7 @@ tensorboard --logdir logs/rsl_rl --port 6006
 - [x] 增加平地目标落点命令与落点精度训练阶段；
 - [x] 增加低障碍物 Oracle 触发与实体碰撞训练阶段；
 - [x] 增加细粒度障碍物高度/宽度课程与前向高度扫描；
+- [x] 增加无动力沉降、力矩渐入、伸腿站立和策略交接开环测试；
 - [ ] 从外部触发跳跃扩展到感知驱动的自主越障；
 - [ ] 加入多随机种子评估和自动回归测试；
 - [ ] 完成延迟、噪声、摩擦和电机参数随机化；

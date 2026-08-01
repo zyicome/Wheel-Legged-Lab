@@ -319,6 +319,8 @@ def obstacle_geometry_curriculum(
     env_ids: Sequence[int],
     height_levels: tuple[float, ...] = (0.02, 0.04, 0.06, 0.08),
     width_levels: tuple[float, ...] = (0.035, 0.050, 0.065, 0.080),
+    speed_min_levels: tuple[float, ...] = (0.45, 0.50, 0.60, 0.70),
+    speed_max_levels: tuple[float, ...] = (0.60, 0.65, 0.75, 0.75),
     initial_level: int = 0,
     success_threshold: float = 0.65,
     clear_threshold: float = 0.80,
@@ -326,14 +328,45 @@ def obstacle_geometry_curriculum(
     min_trials: int = 1024,
     consecutive_passes: int = 2,
 ) -> torch.Tensor:
-    """Advance real obstacle geometry after consecutive reliable trial windows."""
-    if len(height_levels) != len(width_levels) or not height_levels:
-        raise ValueError("height_levels and width_levels must have equal non-zero length.")
+    """Advance compatible obstacle geometry and approach-speed ranges."""
+    level_count = len(height_levels)
+    if (
+        not level_count
+        or len(width_levels) != level_count
+        or len(speed_min_levels) != level_count
+        or len(speed_max_levels) != level_count
+    ):
+        raise ValueError(
+            "height, width, speed-min and speed-max levels must have equal "
+            "non-zero length."
+        )
+    if any(
+        low <= 0.0 or high < low
+        for low, high in zip(speed_min_levels, speed_max_levels)
+    ):
+        raise ValueError("Each obstacle speed range must satisfy 0 < min <= max.")
+
+    def apply_speed_range(level: int) -> None:
+        # Fixed Play geometry is an evaluation override; do not silently
+        # replace a command range supplied on the CLI in that mode.
+        oracle_cfg = getattr(env.cfg, "obstacle_oracle", None)
+        if oracle_cfg is not None and (
+            oracle_cfg.fixed_height is not None or oracle_cfg.fixed_width is not None
+        ):
+            return
+        ranges = env.command_manager.get_term("wheel_legged_commands").cfg.ranges
+        ranges.lin_vel_x = (
+            float(speed_min_levels[level]),
+            float(speed_max_levels[level]),
+        )
+
     if not hasattr(env, "_obstacle_curriculum_level"):
         if not 0 <= initial_level < len(height_levels):
             raise ValueError(f"initial_level must be in [0, {len(height_levels) - 1}].")
         env._obstacle_height_levels = tuple(float(v) for v in height_levels)
         env._obstacle_width_levels = tuple(float(v) for v in width_levels)
+        env._obstacle_speed_min_levels = tuple(float(v) for v in speed_min_levels)
+        env._obstacle_speed_max_levels = tuple(float(v) for v in speed_max_levels)
         env._obstacle_curriculum_level = int(initial_level)
         env._obstacle_curriculum_passes = 0
         env._obstacle_curriculum_trials = torch.zeros((), device=env.device)
@@ -343,6 +376,7 @@ def obstacle_geometry_curriculum(
         env._obstacle_curriculum_last_clear = torch.zeros((), device=env.device)
         env._obstacle_curriculum_last_collision = torch.zeros((), device=env.device)
         env._obstacle_curriculum_last_success = torch.zeros((), device=env.device)
+        apply_speed_range(env._obstacle_curriculum_level)
         return torch.tensor(float(initial_level), device=env.device)
 
     if len(env_ids) == 0 or not hasattr(env, "_obstacle_trials"):
@@ -375,8 +409,55 @@ def obstacle_geometry_curriculum(
         ):
             env._obstacle_curriculum_level += 1
             env._obstacle_curriculum_passes = 0
+            apply_speed_range(env._obstacle_curriculum_level)
         env._obstacle_curriculum_trials.zero_()
         env._obstacle_curriculum_clears.zero_()
         env._obstacle_curriculum_collisions.zero_()
         env._obstacle_curriculum_successes.zero_()
     return torch.tensor(float(env._obstacle_curriculum_level), device=env.device)
+
+
+def wheel_legged_terrain_levels(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    asset_cfg=None,
+    command_name: str = "wheel_legged_commands",
+    minimum_command_speed: float = 0.15,
+    promotion_tracking_ratio: float = 0.70,
+    demotion_tracking_ratio: float = 0.35,
+    minimum_command_distance: float = 0.75,
+) -> torch.Tensor:
+    """Adjust terrain rows from command-aligned progress over an episode.
+
+    Net world displacement is unsuitable because the command can reverse during
+    an episode.  The robust environment therefore accumulates commanded travel
+    and travel in the requested body-x direction.  Turning in place and nearly
+    stationary commands neither promote nor demote a terrain.
+    """
+    from isaaclab.managers import SceneEntityCfg
+
+    if asset_cfg is None:
+        asset_cfg = SceneEntityCfg("robot")
+    terrain = env.scene.terrain
+    if terrain.cfg.terrain_type != "generator":
+        return torch.zeros((), device=env.device)
+    if len(env_ids) == 0:
+        return torch.mean(terrain.terrain_levels.float())
+
+    env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=env.device)
+    if not hasattr(env, "_terrain_commanded_distance"):
+        raise RuntimeError(
+            "wheel_legged_terrain_levels requires WheelLeggedRobustEnv progress buffers."
+        )
+    commanded_distance = env._terrain_commanded_distance[env_ids]
+    tracked_distance = env._terrain_tracking_distance[env_ids]
+    tracking_ratio = tracked_distance / commanded_distance.clamp_min(1.0e-6)
+    # Keep the speed parameter meaningful if episode duration is changed.
+    enough_command = commanded_distance >= max(
+        minimum_command_distance,
+        minimum_command_speed * env.max_episode_length_s * 0.25,
+    )
+    move_up = enough_command & (tracking_ratio >= promotion_tracking_ratio)
+    move_down = enough_command & (tracking_ratio < demotion_tracking_ratio)
+    terrain.update_env_origins(env_ids, move_up, move_down)
+    return torch.mean(terrain.terrain_levels.float())

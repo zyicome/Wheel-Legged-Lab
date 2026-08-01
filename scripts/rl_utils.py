@@ -43,10 +43,17 @@ WHEEL_LEGGED_DEBUG_METRICS: tuple[tuple[str, str], ...] = (
     ("lf0_pos", "lf0"),
     ("joint_margin_min", "joint_margin"),
     ("torque_saturation", "tau_clip"),
+    ("motor_enable_scale", "motor"),
     ("tilt_angle", "tilt"),
     ("wheel_action_abs", "|a_w|"),
     ("wheel_action_clip_fraction", "clip_w"),
     ("wheel_vel_abs", "|ω_w|"),
+    ("recovery_success_rate", "R成功"),
+    ("recovery_failure_rate", "R失败"),
+    ("recovery_mean_time", "R用时"),
+    ("recovery_pending_rate", "R进行"),
+    ("terrain_level", "T档"),
+    ("terrain_tracking_ratio", "T跟踪"),
     ("jump_phase_crouch", "J蹲"),
     ("jump_phase_thrust", "J蹬"),
     ("jump_phase_flight", "J空"),
@@ -202,7 +209,7 @@ def install_rsl_rl_action_std_bounds(
 
 
 class WheelLeggedKeyboardController:
-    """Inject keyboard locomotion and one-shot jump commands during playback."""
+    """Inject keyboard locomotion, jump and power-cycle requests during playback."""
 
     def __init__(
         self,
@@ -225,6 +232,7 @@ class WheelLeggedKeyboardController:
         self.jump_command_term = self.env.command_manager._terms.get("jump_command")
         self._jump_pulse_steps_remaining = 0
         self._jump_pulse_steps = 1
+        self._power_cycle_requested = False
         self.jump_height = 0.0
         self.jump_distance = 0.0
         if self.jump_command_term is not None:
@@ -271,6 +279,7 @@ class WheelLeggedKeyboardController:
         self.keyboard.add_callback("R", self._raise_height)
         self.keyboard.add_callback("F", self._lower_height)
         self.keyboard.add_callback("L", self._reset_height)
+        self.keyboard.add_callback("K", self._request_power_cycle)
         if self.jump_command_term is not None:
             self.keyboard.add_callback("J", self._request_jump)
 
@@ -295,6 +304,7 @@ class WheelLeggedKeyboardController:
         print(
             "\tRaise body height: R\n"
             "\tLower body height: F\n"
+            "\tPower off / restart: K\n"
             f"\tHeight range: [{self.height_min:.2f}, {self.height_max:.2f}] m\n"
             "\tLateral keys are disabled for this non-holonomic robot."
         )
@@ -328,6 +338,33 @@ class WheelLeggedKeyboardController:
             "[KEYBOARD] jump requested, "
             f"height={self.jump_height:.3f} m, distance={self.jump_distance:.3f} m"
         )
+
+    def _request_power_cycle(self):
+        self._power_cycle_requested = True
+
+    def consume_power_cycle_request(self) -> bool:
+        """Return and clear the edge-triggered K-key request."""
+        requested = self._power_cycle_requested
+        self._power_cycle_requested = False
+        return requested
+
+    def stop_commands(self, *, cancel_jump: bool = True) -> None:
+        """Hold all user commands at zero while actuator power is unavailable."""
+        command = self.command_term.command
+        command[:, 0] = 0.0
+        command[:, 1] = 0.0
+        command[:, 2] = self.height
+        command[:, 3] = 0.0
+        if cancel_jump and self.jump_command_term is not None:
+            self._jump_pulse_steps_remaining = 0
+            self.jump_command_term.command[:, 0] = 0.0
+
+    def cancel_active_jump(self) -> None:
+        """Cancel Play-only jump state before simulating actuator power loss."""
+        self.stop_commands(cancel_jump=True)
+        if hasattr(self.env, "jump_phase"):
+            self.env.jump_phase.zero_()
+            self.env.jump_phase_time.zero_()
 
     def update(self):
         """Copy keyboard state and advance the finite jump trigger pulse."""

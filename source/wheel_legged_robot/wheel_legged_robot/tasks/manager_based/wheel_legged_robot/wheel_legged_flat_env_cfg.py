@@ -288,6 +288,7 @@ class WheelLeggedVMCEnv(ManagerBasedRLEnv):
             joint_margin = torch.minimum(leg_pos - leg_limits[..., 0], leg_limits[..., 1] - leg_pos)
             log["joint_margin_min"] = joint_margin.min(dim=1).values.mean().item()
             log["torque_saturation"] = vmc_term.torque_saturation.mean().item()
+            log["motor_enable_scale"] = vmc_term.motor_enable_scale.mean().item()
 
         # 命令值（所有环境平均）
         if hasattr(self, "command_manager"):

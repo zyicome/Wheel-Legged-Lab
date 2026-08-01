@@ -40,6 +40,9 @@ class VMCAction(ActionTerm):
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
         self._torque_saturation = torch.zeros(self.num_envs, device=self.device)
+        # Per-environment output gate used by power-on and controller hand-off
+        # state machines.  Ordinary tasks remain fully enabled by default.
+        self._motor_enable_scale = torch.ones(self.num_envs, device=self.device)
 
         # 缓存上一时刻的运动学状态（供观测使用）
         self._theta0 = torch.zeros(self._num_envs, 2, device=self._device)
@@ -95,6 +98,40 @@ class VMCAction(ActionTerm):
         """Per-environment fraction of motors whose requested torque was clipped."""
         return self._torque_saturation
 
+    @property
+    def motor_enable_scale(self) -> torch.Tensor:
+        """Current per-environment actuator-output scale in ``[0, 1]``."""
+        return self._motor_enable_scale
+
+    def set_motor_enable_scale(
+        self,
+        scale: float | torch.Tensor,
+        env_ids: Sequence[int] | torch.Tensor | None = None,
+    ) -> None:
+        """Set a safe actuator-output ramp without changing policy actions.
+
+        A zero scale represents an unpowered robot.  Clearing the wheel PI
+        integral while disabled prevents wind-up during passive settling.
+        """
+        if env_ids is None:
+            env_ids = slice(None)
+            target = self._motor_enable_scale
+        else:
+            env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+            target = self._motor_enable_scale[env_ids]
+        scale_tensor = torch.as_tensor(scale, dtype=target.dtype, device=self.device)
+        if scale_tensor.ndim == 0:
+            scale_tensor = scale_tensor.expand_as(target)
+        else:
+            scale_tensor = torch.broadcast_to(scale_tensor, target.shape)
+        self._motor_enable_scale[env_ids] = scale_tensor.clamp(0.0, 1.0)
+        disabled = self._motor_enable_scale[env_ids] <= 1.0e-4
+        if torch.any(disabled):
+            if isinstance(env_ids, slice):
+                self._wheel_vel_integral[disabled] = 0.0
+            else:
+                self._wheel_vel_integral[env_ids[disabled]] = 0.0
+
     def process_actions(self, actions: torch.Tensor):
         # 保留网络原始输出用于诊断，但控制器只接收有界动作。不能依赖 PPO
         # distribution 自行限幅：Normal distribution 的采样理论上是无界的。
@@ -102,12 +139,15 @@ class VMCAction(ActionTerm):
         self._processed_actions[:] = torch.clamp(actions, -self.cfg.action_clip, self.cfg.action_clip)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
         self._theta0[env_ids] = 0.0
         self._L0[env_ids] = 0.0
         self._wheel_vel_integral[env_ids] = 0.0
         self._torque_saturation[env_ids] = 0.0
+        self._motor_enable_scale[env_ids] = 1.0
 
     def _compute_kinematics(self):
         """Compute and publish the current virtual-leg state from joint state."""
@@ -126,8 +166,12 @@ class VMCAction(ActionTerm):
         L0, theta0 = self._forward_kinematics(theta1, theta2)
 
         # 更新缓存的状态（供 VMC 映射和观测使用）
-        self._theta0 = theta0.clone()
-        self._L0 = L0.clone()
+        # Keep the buffers allocated during construction. Rebinding them to a
+        # clone created under ``torch.inference_mode()`` turns them into
+        # inference tensors, which cannot later be cleared by an interactive
+        # Play callback running outside that context (for example K power-off).
+        self._theta0.copy_(theta0)
+        self._L0.copy_(L0)
 
         # 3. 计算导数 — 使用关节速度 + FK（与原始 Isaac Gym 一致，比位置差分更准确）
         # 原始代码：leg_post_physics_step() 中 dt=0.001
@@ -195,11 +239,22 @@ class VMCAction(ActionTerm):
         # apply_actions 每个 physics step 都会调用，因此必须使用 physics_dt，
         # 而不是 control step_dt（decimation > 1 时后者会重复积分）。
         dt = self._env.physics_dt if hasattr(self._env, "physics_dt") else 0.005
-        self._wheel_vel_integral += wheel_vel_error * dt * self.cfg.kp_wheel_integral
+        self._wheel_vel_integral += (
+            wheel_vel_error
+            * dt
+            * self.cfg.kp_wheel_integral
+            * self._motor_enable_scale.unsqueeze(-1)
+        )
         # 积分贡献限制为轮电机力矩上限的一部分，避免长时间饱和后 wind-up。
         wheel_effort_limits = self._asset.data.joint_effort_limits[:, self._joint_ids][:, [2, 5]]
         integral_limit = wheel_effort_limits * self.cfg.wheel_integral_limit_ratio
-        self._wheel_vel_integral = torch.clamp(self._wheel_vel_integral, -integral_limit, integral_limit)
+        self._wheel_vel_integral.copy_(
+            torch.clamp(
+                self._wheel_vel_integral,
+                -integral_limit,
+                integral_limit,
+            )
+        )
         torque_wheel = self.cfg.kp_wheel * wheel_vel_error + self._wheel_vel_integral
 
         # 6. 通过 VMC 雅可比映射到关节力矩
@@ -218,6 +273,7 @@ class VMCAction(ActionTerm):
 
         # 应用力矩缩放
         torques = torques * self._torque_scale
+        torques = torques * self._motor_enable_scale.unsqueeze(-1)
 
         # 获取每个关节的力矩限位（如果多个环境共享同一限位，可取第一行）
         effort_limits = self._asset.data.joint_effort_limits[:, self._joint_ids]  # (num_envs, 6)

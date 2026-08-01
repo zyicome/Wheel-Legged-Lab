@@ -2,10 +2,12 @@
 
 ## 1. 目标与完整阶段
 
-流水线现在覆盖从基础平地到 Oracle 实体障碍物的全部七个阶段：
+流水线现在覆盖从基础平地到 Oracle 实体障碍物的全部九个阶段：
 
 ```text
 flat
+→ recovery
+→ terrain_reactive
 → jump_flat
 → high_landing
 → clearance
@@ -18,6 +20,8 @@ flat
 
 ```text
 Wheel-Legged-Flat-v0
+→ Wheel-Legged-Recovery-Flat-v0
+→ Wheel-Legged-Terrain-Reactive-v0
 → Wheel-Legged-Jump-Flat-v0
 → Wheel-Legged-Jump-High-Landing-Flat-v0
 → Wheel-Legged-Jump-Clearance-Flat-v0
@@ -26,7 +30,9 @@ Wheel-Legged-Flat-v0
 → Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0
 ```
 
-外层流水线负责任务切换、checkpoint 迁移和自动验收；移动跳跃任务内部把
+`recovery` 只处理可恢复倾角和推撞，不包含完全侧躺起立；
+`terrain_reactive` 使用本体感觉适应坡面、低阶梯和粗糙地面。外层流水线负责
+任务切换、checkpoint 迁移和自动验收；移动跳跃任务内部把
 速度从 `0.2` 自动提高到 `1.0 m/s`，障碍物任务内部把几何从第 0 档提高到
 第 6 档。
 
@@ -64,7 +70,7 @@ Wheel-Legged-Flat-v0
 - `--start-stage`：该模型所属的阶段，不是准备进入的阶段；
 - `--start-mode continue|next`：继续当前阶段，或确认当前阶段已合格并进入下一阶段。
 
-例如从合格 Flat 模型直接进入 Jump Flat，并训练到 Clearance：
+例如从合格 Flat 模型进入 Recovery，并训练到 Clearance：
 
 ```bash
 ./scripts/rsl_rl/train_staged.sh \
@@ -74,9 +80,9 @@ Wheel-Legged-Flat-v0
   --end-stage clearance
 ```
 
-流水线会自动调用 `expand_rsl_checkpoint_for_jump.py` 扩展 Actor、Critic 和
-观测归一化器。旧参数 `--flat-checkpoint PATH` 仍兼容，等价于
-`flat + next`。
+流水线在 `terrain_reactive → jump_flat` 时自动调用
+`expand_rsl_checkpoint_for_jump.py` 扩展 Actor、Critic 和观测归一化器。旧参数
+`--flat-checkpoint PATH` 仍兼容，等价于 `flat + next`，即从 Recovery 开始。
 
 继续训练尚未达标的第六档障碍物模型：
 
@@ -92,8 +98,8 @@ Wheel-Legged-Flat-v0
 所有合法阶段名依次为：
 
 ```text
-flat, jump_flat, high_landing, clearance,
-moving_curriculum, target_landing, obstacle_oracle
+flat, recovery, terrain_reactive, jump_flat, high_landing,
+clearance, moving_curriculum, target_landing, obstacle_oracle
 ```
 
 `continue` 恢复网络、优化器和 iteration，并继续执行当前阶段验收；`next`
@@ -114,6 +120,8 @@ moving_curriculum, target_landing, obstacle_oracle
 | 阶段 | 主要训练态验收条件 |
 |---|---|
 | Flat | 速度档 `≥0.99 m/s`、yaw 档 `≥1.99 rad/s`、线速度得分 `≥0.85`、角速度得分 `≥0.79` |
+| Recovery | 扰动恢复成功率 `≥0.70`、失败率 `≤0.30`、速度跟踪增益 `≥0.55` |
+| Terrain Reactive | 恢复成功率 `≥0.68`、命令方向行驶比 `≥0.65`、倾角 `≤0.35 rad` |
 | Jump Flat | 起跳 `≥0.45 m/s`、机身上升 `≥0.055 m`、滞空 `≥0.125 s`、成功率 `≥0.62` |
 | High Landing | 上升 `≥0.085 m`、成功率 `≥0.42`、柔落率 `≥0.70`、平均落速绝对值 `≤1.0 m/s` |
 | Clearance | 轮端净空 `≥0.095 m`、成功率 `≥0.60`、柔落率 `≥0.75` |
@@ -129,7 +137,10 @@ moving_curriculum, target_landing, obstacle_oracle
 
 ## 5. Checkpoint 迁移
 
-- Flat → Jump Flat：自动扩展跳跃观测输入，再只加载网络权重。
+- Flat → Recovery → Terrain Reactive：Actor 维度一致，直接迁移网络权重。
+- Terrain Reactive → Jump Flat：自动扩展跳跃观测输入，再只加载网络权重。
+- 可选的 Terrain Perceptive Actor 多 15 维局部高度扫描，不属于默认流水线；
+  从 Reactive 单独训练时由 `train.py` 自动扩展输入层。
 - Jump Flat → Target Landing：观测和动作维度一致，直接迁移权重。
 - Target Landing → Obstacle Oracle：障碍物观测多 10 维前向扫描；
   `train.py` 在 `--load_weights_only` 时自动扩展 checkpoint 输入层。
@@ -152,7 +163,7 @@ logs/rsl_rl/staged_pipeline/<timestamp>/
 - `model_flat_jump_init.pt`：需要时生成的 Flat→Jump 转换模型。
 
 当请求区间全部通过时，`state.json` 中 `passed=true` 表示“指定的开始/结束
-区间已经完成”，不一定表示七阶段全部完成。若某阶段用完最大 iteration 仍
+区间已经完成”，不一定表示九阶段全部完成。若某阶段用完最大 iteration 仍
 未通过，流水线立即返回非零状态并保留 checkpoint，不会把未达标模型迁移到
 更困难阶段。
 

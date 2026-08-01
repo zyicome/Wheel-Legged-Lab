@@ -43,6 +43,11 @@ def push_robots_by_force(
         body_ids=[0],
         env_ids=env_ids,
     )
+    # Recovery tasks use the push as a well-defined evaluation trial.  Keep the
+    # event generic so the flat/jump environments do not need the extra state.
+    start_recovery = getattr(env, "start_recovery_attempt", None)
+    if start_recovery is not None:
+        start_recovery(env_ids)
 
 def randomize_default_joint_pos(
     env: ManagerBasedEnv,

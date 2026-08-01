@@ -148,11 +148,19 @@ class ObstacleOracleCfg:
     # training curriculum active; explicit values bypass its random range.
     fixed_height: float | None = None
     fixed_width: float | None = None
+    # The horizontal landing command must remain compatible with the distance
+    # that can be travelled during the measured flight time.  Computing it
+    # from the remaining obstacle distance made the requested landing point
+    # grow when a policy slowed down, producing unreachable 0.25--0.30 m hops.
+    expected_air_time: float = 0.18
+    target_distance_min: float = 0.08
+    target_distance_max: float = 0.16
     preparation_time: float = 0.44
-    takeoff_margin: float = 0.03
-    # The 8 cm-wide level needs a little more distance after the far edge so
-    # the policy does not trade a nominal target hit for wheel-edge contact.
-    landing_margin: float = 0.06
+    # Desired root-to-near-edge distance at takeoff.  It is derived from the
+    # speed-feasible landing distance and clamped to this interval.
+    takeoff_margin: float = 0.02
+    max_takeoff_margin: float = 0.07
+    landing_margin: float = 0.02
     minimum_clearance: float = 0.015
     wheel_radius: float = 0.0675
     contact_force_threshold: float = 2.0
@@ -964,24 +972,29 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
             torch.full_like(self.obstacle_height, 0.08),
         )
         # This value is latched by the jump state machine at confirmed
-        # takeoff. Aim beyond the actual far edge from the *current* root
-        # position instead of requesting the former fixed 10.5 cm hop.
+        # takeoff.  Keep it ballistically compatible with the command speed;
+        # tying it to ``near_distance`` creates an unreachable target whenever
+        # the policy brakes during crouch/thrust.
         target_distance = torch.clamp(
-            near_distance + self.obstacle_width + cfg.landing_margin,
-            min=0.10,
-            max=0.30,
+            velocity_command[:, 0].abs() * cfg.expected_air_time,
+            min=cfg.target_distance_min,
+            max=cfg.target_distance_max,
         )
         jump_command[:, 1] = target_height
         jump_command[:, 2] = target_distance
 
         idle = self.jump_phase == mdp.JUMP_PHASE_IDLE
+        # Place takeoff so that the feasible landing point lies just beyond
+        # the far edge. Wider levels therefore trigger closer to the barrier,
+        # while faster commands retain more stand-off distance.
+        takeoff_standoff = torch.clamp(
+            target_distance - self.obstacle_width - cfg.landing_margin,
+            min=cfg.takeoff_margin,
+            max=cfg.max_takeoff_margin,
+        )
         trigger_distance = (
             velocity_command[:, 0].abs() * cfg.preparation_time
-            + cfg.takeoff_margin
-            # ``near_distance`` is measured from the robot root. Add half a
-            # wheel radius as anticipation; a full radius moved takeoff so far
-            # forward that the former short-hop policy landed before the edge.
-            + 0.5 * cfg.wheel_radius
+            + takeoff_standoff
         )
         trigger = (
             idle
@@ -1819,7 +1832,9 @@ class WheelLeggedObstacleOracleCommandsCfg(WheelLeggedTargetLandingCommandsCfg):
         rel_heading_envs=1.0,
         hold_command_during_jump=True,
         ranges=mdp.WheelLeggedCommandCfg.Ranges(
-            lin_vel_x=(0.45, 0.75),
+            # Level 0 starts close to the distribution already mastered by
+            # target-landing. The geometry curriculum expands this range.
+            lin_vel_x=(0.45, 0.60),
             ang_vel_yaw=(-0.40, 0.40),
             height=(0.20, 0.22),
             heading=(0.0, 0.0),
@@ -1831,7 +1846,9 @@ class WheelLeggedObstacleOracleCommandsCfg(WheelLeggedTargetLandingCommandsCfg):
         trigger_delay_range=(1.0e9, 1.0e9),
         trigger_pulse_time=0.10,
         target_height_range=(0.08, 0.10),
-        target_distance_range=(0.105, 0.105),
+        # Overwritten every step by the oracle with vx * expected_air_time;
+        # this range documents and bounds the actual training distribution.
+        target_distance_range=(0.08, 0.16),
         couple_distance_to_velocity=False,
     )
 
@@ -1894,6 +1911,11 @@ class WheelLeggedObstacleGeometryCurriculumCfg:
             # 8 cm high × 8 cm wide barrier.
             "height_levels": (0.02, 0.04, 0.05, 0.06, 0.07, 0.08, 0.08),
             "width_levels": (0.035, 0.035, 0.050, 0.050, 0.065, 0.065, 0.080),
+            # Wider obstacles require greater horizontal travel during the
+            # same ~0.18 s flight. Couple the command range to geometry so no
+            # level samples physically incompatible speed/width pairs.
+            "speed_min_levels": (0.45, 0.45, 0.50, 0.50, 0.60, 0.60, 0.70),
+            "speed_max_levels": (0.60, 0.65, 0.65, 0.70, 0.75, 0.75, 0.75),
             "initial_level": 0,
             # The final O成功 metric remains strict; this lower value only
             # prevents a good-crossing/high-collision-improving policy from
