@@ -1917,16 +1917,16 @@ class WheelLeggedObstacleGeometryCurriculumCfg:
             "speed_min_levels": (0.45, 0.45, 0.50, 0.50, 0.60, 0.60, 0.70),
             "speed_max_levels": (0.60, 0.65, 0.65, 0.70, 0.75, 0.75, 0.75),
             "initial_level": 0,
-            # The final O成功 metric remains strict; this lower value only
-            # prevents a good-crossing/high-collision-improving policy from
-            # being held at one level by a few landing/recovery failures.
-            "success_threshold": 0.45,
-            "clear_threshold": 0.75,
-            # This is an advancement gate, not the final acceptance target.
-            # Level 0 already clears reliably, but requiring <=25% wheel
-            # contact keeps it from advancing on crossings that still collide.
-            "collision_threshold": 0.25,
-            "min_trials": 1024,
+            # These are progression gates rather than final acceptance rules.
+            # Once a policy has a repeatable basic skill, expose the next
+            # geometry instead of waiting for near-mastery of the current one.
+            "success_threshold": 0.40,
+            "clear_threshold": 0.68,
+            # Wheel-edge contact remains useful learning signal at the next
+            # level. Base/leg collision and strict O成功 definitions are not
+            # relaxed by this curriculum-only threshold.
+            "collision_threshold": 0.38,
+            "min_trials": 768,
             "consecutive_passes": 2,
         },
     )
