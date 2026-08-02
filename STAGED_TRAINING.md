@@ -2,7 +2,7 @@
 
 ## 1. 目标与完整阶段
 
-流水线现在覆盖从基础平地到 Oracle 实体障碍物的全部九个阶段：
+流水线现在覆盖从基础平地到深度感知实体障碍物的全部十个阶段：
 
 ```text
 flat
@@ -14,6 +14,7 @@ flat
 → moving_curriculum
 → target_landing
 → obstacle_oracle
+→ obstacle_perceptive
 ```
 
 对应任务：
@@ -28,6 +29,7 @@ Wheel-Legged-Flat-v0
 → Wheel-Legged-Jump-Moving-Curriculum-Flat-v0
 → Wheel-Legged-Jump-Target-Landing-Flat-v0
 → Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0
+→ Wheel-Legged-Jump-Obstacle-Perceptive-Flat-v0
 ```
 
 `recovery` 只处理可恢复倾角和推撞，不包含完全侧躺起立；
@@ -60,7 +62,7 @@ Wheel-Legged-Flat-v0
 ./scripts/rsl_rl/train_staged.sh --dry-run --end-stage target_landing
 ```
 
-未提供 `--end-stage` 时默认训练到配置中的最后阶段 `obstacle_oracle`。
+未提供 `--end-stage` 时默认训练到配置中的最后阶段 `obstacle_perceptive`。
 
 ## 3. 从已有 checkpoint 开始
 
@@ -99,14 +101,15 @@ Wheel-Legged-Flat-v0
 
 ```text
 flat, recovery, terrain_reactive, jump_flat, high_landing,
-clearance, moving_curriculum, target_landing, obstacle_oracle
+clearance, moving_curriculum, target_landing, obstacle_oracle,
+obstacle_perceptive
 ```
 
 `continue` 恢复网络、优化器和 iteration，并继续执行当前阶段验收；`next`
 只迁移 Actor/Critic，使用新优化器和新 iteration。`--end-stage` 不能早于
 实际开始训练的阶段。例如 `--start-stage clearance --start-mode next`
 实际从 `moving_curriculum` 开始，因此不能同时指定 `--end-stage clearance`。
-最终阶段 `obstacle_oracle` 后没有下一阶段，只能使用 `continue`。
+最终阶段 `obstacle_perceptive` 后没有下一阶段，只能使用 `continue`。
 
 ## 4. 自动验收原则
 
@@ -128,6 +131,7 @@ clearance, moving_curriculum, target_landing, obstacle_oracle
 | Moving Curriculum | 到第 4 档、移动得分 `≥0.75`、课程成功 `≥0.70`、柔落 `≥0.75`、航向 `≥0.76` |
 | Target Landing | 成功率 `≥0.50`、落点成功 `≥0.68`、平均落点误差 `≤0.045 m`、柔落 `≥0.65` |
 | Obstacle Oracle | 到第 6 档、课程成功 `≥0.45`、课程跨越 `≥0.75`、课程碰撞 `≤0.28`；累计成功 `≥0.40`、跨越 `≥0.70`、碰撞 `≤0.30` |
+| Obstacle Perceptive | 到第 6 档、感知有效率 `≥0.70`、累计成功 `≥0.30`、跨越 `≥0.65`、碰撞 `≤0.40` |
 
 各阶段仍检查 `torque_saturation ≤ 0.05`，跳跃阶段也保留恢复失败率限制。
 这些是带探索噪声的训练态自动切换门槛，不等于最终确定性 Play 验收值。

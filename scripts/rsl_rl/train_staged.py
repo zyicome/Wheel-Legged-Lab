@@ -328,7 +328,7 @@ def main() -> int:
             stage["task"],
             "--headless",
             "--num_envs",
-            str(args.num_envs),
+            str(stage.get("num_envs", args.num_envs)),
             "--max_iterations",
             str(stage["max_iterations"]),
             "--run_name",

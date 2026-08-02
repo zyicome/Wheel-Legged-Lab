@@ -148,7 +148,8 @@ for duration_name in (
         parser.error(f"--{duration_name} must be positive.")
 if args_cli.power_restart_max_tilt <= 0.0:
     parser.error("--power_restart_max_tilt must be positive.")
-# always enable cameras to record video
+# RTX cameras are only needed for video. The perceptive task uses the scalable
+# ray-cast depth backend and therefore remains available in normal headless mode.
 if args_cli.video:
     args_cli.enable_cameras = True
 
@@ -356,7 +357,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if hasattr(env_cfg.commands, "wheel_legged_commands"):
         command_cfg = env_cfg.commands.wheel_legged_commands
         if (
-            task_name == "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0"
+            task_name in (
+                "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0",
+                "Wheel-Legged-Jump-Obstacle-Perceptive-Flat-v0",
+            )
             and not args_cli.keyboard
         ):
             command_cfg.ranges.lin_vel_x = (
@@ -396,7 +400,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if obstacle_cfg is None:
             raise ValueError(
                 "--obstacle_height/--obstacle_width require "
-                "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0."
+                "an Oracle or Perceptive obstacle task."
             )
         if args_cli.obstacle_height is not None:
             obstacle_height = float(args_cli.obstacle_height)

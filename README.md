@@ -148,6 +148,9 @@ Wheel-Legged-Jump-Moving-Curriculum-Flat-v0
 | `Wheel-Legged-Jump-Clearance-Flat-v0` | 空中收腿和 `0.08–0.12 m` 轮端净空 |
 | `Wheel-Legged-Jump-Moving-Flat-v0` | 第一档低速移动跳跃 |
 | `Wheel-Legged-Jump-Moving-Curriculum-Flat-v0` | 从 `0.2 m/s` 自动训练到 `1.0 m/s` 的移动跳跃 |
+| `Wheel-Legged-Jump-Target-Landing-Flat-v0` | 根据速度解算目标落点并训练落点精度 |
+| `Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0` | 使用仿真真值触发的实体障碍物课程 |
+| `Wheel-Legged-Jump-Obstacle-Perceptive-Flat-v0` | 使用前向深度感知触发障碍物跳跃 |
 
 ## 项目结构
 
@@ -525,14 +528,65 @@ Play 不恢复训练时的课程状态；没有显式参数时会从第 0 档开
 宽度必须大于零。Oracle 环境会根据所选几何自动计算跳跃高度和落点距离，
 因此一般不需要再传 `--jump_height` 或 `--jump_distance`。
 
+### 训练深度感知障碍物阶段
+
+`Wheel-Legged-Jump-Obstacle-Perceptive-Flat-v0` 用前向深度数据代替 Oracle
+几何真值控制跳跃。仿真中使用可并行扩展的 ray-cast 深度相机（详细资料请查看：[IssacLab射线投射器官方文档](https://docs.robotsfan.com/isaaclab/source/overview/core-concepts/sensors/ray_caster.html)），以 `25 Hz`、
+`24×32` 分辨率采集前方点云；经过机身姿态补偿、地面去除和横向区域过滤后，
+压缩为与 Oracle 阶段一致的 10 维前向高度扫描，并估算：
+
+```text
+障碍物前缘距离 + 障碍物高度 + 障碍物宽度
+                       ↓
+          跳跃高度、落点距离与触发时机
+```
+
+Actor 只使用深度扫描，不读取障碍物的仿真坐标或尺寸；精确几何仅用于训练奖励、
+课程统计和 privileged critic。因此 Oracle checkpoint 的 Actor/Critic 输入维度
+保持不变，可以直接迁移：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/train.py \
+  --task Wheel-Legged-Jump-Obstacle-Perceptive-Flat-v0 \
+  --headless \
+  --num_envs 512 \
+  --load_checkpoint_path /absolute/path/to/obstacle_oracle/model_xxx.pt \
+  --load_weights_only \
+  --obstacle_initial_level 0 \
+  --run_name obstacle_perceptive
+```
+
+深度处理比纯状态训练更耗显存和计算量，因此该阶段默认使用 512 个环境。训练时
+关注 `P有效`、`P触发距`、`P距误差`、`P高误差`、`P宽误差`；其中 `P有效`
+是当前障碍物周期内已经建立有效跟踪的环境比例，触发起跳后会保持到下一次
+障碍物重置。`P距离` 是尚未触发样本的平均观测距离，通常会被刚进入视野的
+远处障碍物拉高；判断触发是否正常应查看 `P触发距` 和 `O触发误差`。
+
+固定 8 cm 障碍物 Play 测试：
+
+```bash
+"${ISAACLAB_ROOT}/isaaclab.sh" -p scripts/rsl_rl/play.py \
+  --task Wheel-Legged-Jump-Obstacle-Perceptive-Flat-v0 \
+  --checkpoint /absolute/path/to/obstacle_perceptive/model_xxx.pt \
+  --num_envs 10 \
+  --command_range 0.75 \
+  --yaw_command_range 0.4 \
+  --obstacle_height 0.08 \
+  --obstacle_width 0.08
+```
+
+实机部署时可将深度相机或激光雷达点云经过相同的坐标变换、地面去除和 10 格
+压缩后送入策略，不需要仿真中的障碍物真值。当前环境负责验证运动控制与感知
+接口，传感器噪声、盲区、外参误差和时延随机化仍应在 Sim-to-Real 前补充。
+
 ### 一键完成全部阶段
 
-流水线现在覆盖九个阶段：
+流水线现在覆盖十个阶段：
 
 ```text
 flat → recovery → terrain_reactive → jump_flat → high_landing
      → clearance → moving_curriculum
-     → target_landing → obstacle_oracle
+     → target_landing → obstacle_oracle → obstacle_perceptive
 ```
 
 从平地开始并训练到最终障碍物阶段：
@@ -559,7 +613,7 @@ flat → recovery → terrain_reactive → jump_flat → high_landing
   --start-checkpoint /absolute/path/to/model.pt \
   --start-stage moving_curriculum \
   --start-mode next \
-  --end-stage obstacle_oracle
+  --end-stage obstacle_perceptive
 ```
 
 恢复参数含义：
@@ -570,17 +624,18 @@ flat → recovery → terrain_reactive → jump_flat → high_landing
 | `--start-stage` | 该模型所属阶段，而不是准备进入的阶段 |
 | `--start-mode continue` | 恢复当前阶段的网络、优化器和 iteration，并继续验收 |
 | `--start-mode next` | 确认来源阶段合格，只迁移权重并从下一阶段开始 |
-| `--end-stage` | 最后训练和验收的阶段；默认 `obstacle_oracle` |
+| `--end-stage` | 最后训练和验收的阶段；默认 `obstacle_perceptive` |
 
 可用阶段名称为：
 
 ```text
 flat, recovery, terrain_reactive, jump_flat, high_landing,
-clearance, moving_curriculum, target_landing, obstacle_oracle
+clearance, moving_curriculum, target_landing, obstacle_oracle,
+obstacle_perceptive
 ```
 
-`--end-stage` 不能早于实际开始训练的阶段。最终 `obstacle_oracle` 后没有下一
-阶段，所以从该阶段 checkpoint 启动时应使用 `--start-mode continue`。
+`--end-stage` 不能早于实际开始训练的阶段。最终 `obstacle_perceptive` 后没有
+下一阶段，所以从该阶段 checkpoint 启动时应使用 `--start-mode continue`。
 旧参数 `--flat-checkpoint PATH` 仍兼容，等价于 `flat + next`。
 
 流水线使用最近 `20` 个 iteration 的训练指标滑动平均，并连续 `3` 次通过后
@@ -789,6 +844,7 @@ tensorboard --logdir logs/rsl_rl --port 6006
 - [x] 发布可复现 checkpoint 与 TensorBoard 曲线；
 - [x] 增加平地目标落点命令与落点精度训练阶段；
 - [x] 增加低障碍物 Oracle 触发与实体碰撞训练阶段；
+- [x] 增加前向深度感知与非 Oracle 障碍物触发训练阶段；
 - [x] 增加细粒度障碍物高度/宽度课程与前向高度扫描；
 - [x] 增加无动力沉降、力矩渐入、伸腿站立和策略交接开环测试；
 - [ ] 从外部触发跳跃扩展到感知驱动的自主越障；

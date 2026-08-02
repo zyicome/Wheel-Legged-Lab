@@ -22,6 +22,8 @@ from isaaclab.managers import (
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply, quat_from_euler_xyz
 from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg
+from isaaclab.sensors.ray_caster import patterns as ray_patterns
 
 from . import mdp
 from .wheel_legged_flat_env_cfg import (
@@ -166,6 +168,34 @@ class ObstacleOracleCfg:
     contact_force_threshold: float = 2.0
 
 
+@configclass
+class ObstaclePerceptionCfg:
+    """Calibrated depth-camera preprocessing used by the perceptive stage."""
+
+    sensor_name: str = "front_depth_camera"
+    max_distance: float = 1.20
+    minimum_point_height: float = 0.012
+    maximum_point_height: float = 0.14
+    lateral_half_width: float = 0.35
+    minimum_valid_points: int = 4
+    width_prior: float = 0.05
+    width_min: float = 0.02
+    width_max: float = 0.10
+    scan_distances: tuple[float, ...] = (
+        0.10,
+        0.20,
+        0.30,
+        0.40,
+        0.50,
+        0.60,
+        0.70,
+        0.80,
+        0.90,
+        1.00,
+    )
+    scan_half_bin: float = 0.055
+
+
 def _obstacle_body_contact_sensor(body_name: str) -> ContactSensorCfg:
     """Create a valid one-body-to-one-obstacle filtered contact sensor."""
     return ContactSensorCfg(
@@ -214,6 +244,40 @@ class WheelLeggedObstacleSceneCfg(WheelLeggedRobotSceneCfg):
     obstacle_contact_rf1 = _obstacle_body_contact_sensor("rf1_Link")
     obstacle_contact_lwheel = _obstacle_body_contact_sensor("l_wheel_Link")
     obstacle_contact_rwheel = _obstacle_body_contact_sensor("r_wheel_Link")
+
+
+@configclass
+class WheelLeggedPerceptiveObstacleSceneCfg(WheelLeggedObstacleSceneCfg):
+    """Obstacle scene with a scalable ray-cast forward depth camera."""
+
+    front_depth_camera = MultiMeshRayCasterCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base_link",
+        mesh_prim_paths=[
+            MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
+                prim_expr="{ENV_REGEX_NS}/Obstacle",
+                is_shared=True,
+                track_mesh_transforms=True,
+            ),
+        ],
+        update_period=0.04,
+        max_distance=1.20,
+        data_types=["distance_to_image_plane"],
+        depth_clipping_behavior="max",
+        pattern_cfg=ray_patterns.PinholeCameraPatternCfg(
+            focal_length=12.0,
+            horizontal_aperture=20.955,
+            height=24,
+            width=32,
+        ),
+        # In world convention +X is forward and +Z is up. A positive pitch
+        # rotates the optical axis slightly toward the ground.
+        offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
+            pos=(0.13, 0.0, 0.0),
+            rot=(0.997551, 0.0, 0.069943, 0.0),
+            convention="world",
+        ),
+        debug_vis=False,
+    )
 
 
 class WheelLeggedJumpEnv(WheelLeggedVMCEnv):
@@ -794,6 +858,20 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
         )
         self._place_obstacle(torch.arange(self.num_envs, device=self.device))
 
+    def _reset_obstacle_perception(self, env_ids: torch.Tensor):
+        """Reset optional perception state when an obstacle is respawned."""
+
+    def _obstacle_control_estimate(
+        self, near_distance: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return distance, height and width used by the jump controller.
+
+        The Oracle stage deliberately returns simulator truth. Perceptive
+        subclasses override this hook while the physical success metrics below
+        continue to use exact geometry only as training-time supervision.
+        """
+        return near_distance, self.obstacle_height, self.obstacle_width
+
     def _place_obstacle(self, env_ids: torch.Tensor):
         if len(env_ids) == 0:
             return
@@ -868,6 +946,7 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
         self.obstacle_trial_collision[env_ids] = False
         self.obstacle_respawn_pending[env_ids] = False
         self.jump_obstacle_success_ready[env_ids] = False
+        self._reset_obstacle_perception(env_ids)
 
     def _pre_reward_update(self):
         cfg = self.cfg.obstacle_oracle
@@ -886,6 +965,9 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
         near_distance = -0.5 * self.obstacle_width - root_longitudinal
         velocity_command = self.command_manager.get_command(
             "wheel_legged_commands"
+        )
+        control_distance, control_height, control_width = (
+            self._obstacle_control_estimate(near_distance)
         )
 
         body_contact_forces = []
@@ -968,7 +1050,7 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
 
         jump_command = self.command_manager.get_command("jump_command")
         target_height = torch.maximum(
-            self.obstacle_height + cfg.minimum_clearance + 0.025,
+            control_height + cfg.minimum_clearance + 0.025,
             torch.full_like(self.obstacle_height, 0.08),
         )
         # This value is latched by the jump state machine at confirmed
@@ -988,7 +1070,7 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
         # the far edge. Wider levels therefore trigger closer to the barrier,
         # while faster commands retain more stand-off distance.
         takeoff_standoff = torch.clamp(
-            target_distance - self.obstacle_width - cfg.landing_margin,
+            target_distance - control_width - cfg.landing_margin,
             min=cfg.takeoff_margin,
             max=cfg.max_takeoff_margin,
         )
@@ -999,8 +1081,8 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
         trigger = (
             idle
             & ~self.obstacle_trial_triggered
-            & (near_distance > 0.0)
-            & (near_distance <= trigger_distance)
+            & (control_distance > 0.0)
+            & (control_distance <= trigger_distance)
         )
         jump_command[:, 0] = trigger.float()
         if trigger.any():
@@ -1029,6 +1111,352 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
         obstacle_success = completed & self.jump_success_event
         self._obstacle_successes[obstacle_success] += 1.0
         self.obstacle_respawn_pending |= completed
+
+    def _log_debug_metrics(self):
+        super()._log_debug_metrics()
+        if not hasattr(self, "_obstacle_trials"):
+            return
+        log = dict(self.extras.get("log", {}))
+        trials = self._obstacle_trials.sum().clamp_min(1.0)
+        finite = torch.isfinite(self.obstacle_min_clearance)
+        log["obstacle_height"] = self.obstacle_height.mean().item()
+        log["obstacle_width"] = self.obstacle_width.mean().item()
+        fixed_geometry = (
+            self.cfg.obstacle_oracle.fixed_height is not None
+            or self.cfg.obstacle_oracle.fixed_width is not None
+        )
+        log["obstacle_curriculum_level"] = (
+            -1.0
+            if fixed_geometry
+            else float(getattr(self, "_obstacle_curriculum_level", 0))
+        )
+        if hasattr(self, "_obstacle_curriculum_last_success"):
+            log["obstacle_curriculum_success"] = (
+                self._obstacle_curriculum_last_success.item()
+            )
+            log["obstacle_curriculum_clear"] = (
+                self._obstacle_curriculum_last_clear.item()
+            )
+            log["obstacle_curriculum_collision"] = (
+                self._obstacle_curriculum_last_collision.item()
+            )
+        log["obstacle_trigger_error"] = (
+            self.obstacle_trigger_error[self.obstacle_trial_triggered]
+            .abs()
+            .mean()
+            .item()
+            if self.obstacle_trial_triggered.any()
+            else 0.0
+        )
+        log["obstacle_min_clearance"] = (
+            self.obstacle_min_clearance[finite].mean().item()
+            if finite.any()
+            else 0.0
+        )
+        log["obstacle_clear_rate"] = (self._obstacle_clears.sum() / trials).item()
+        log["obstacle_collision_rate"] = (
+            self._obstacle_collisions.sum() / trials
+        ).item()
+        collision_count = self._obstacle_collisions.sum().clamp_min(1.0)
+        log["obstacle_collision_force_mean"] = (
+            self._obstacle_collision_force_sum.sum() / collision_count
+        ).item()
+        log["obstacle_collision_force_peak"] = (
+            self._obstacle_collision_force_peak.max().item()
+        )
+        body_counts = self._obstacle_collision_body_counts.sum(dim=0)
+        log["obstacle_collision_base_fraction"] = (
+            body_counts[0] / collision_count
+        ).item()
+        log["obstacle_collision_upper_leg_fraction"] = (
+            (body_counts[1] + body_counts[3]) / collision_count
+        ).item()
+        log["obstacle_collision_lower_leg_fraction"] = (
+            (body_counts[2] + body_counts[4]) / collision_count
+        ).item()
+        log["obstacle_collision_wheel_fraction"] = (
+            (body_counts[5] + body_counts[6]) / collision_count
+        ).item()
+        log["obstacle_success_rate"] = (
+            self._obstacle_successes.sum() / trials
+        ).item()
+        self.extras["log"] = log
+
+    def _reset_idx(self, env_ids):
+        super()._reset_idx(env_ids)
+        if not hasattr(self, "_obstacle_trials"):
+            return
+        self._obstacle_trials[env_ids] = 0.0
+        self._obstacle_clears[env_ids] = 0.0
+        self._obstacle_collisions[env_ids] = 0.0
+        self._obstacle_successes[env_ids] = 0.0
+        self._obstacle_collision_force_sum[env_ids] = 0.0
+        self._obstacle_collision_force_peak[env_ids] = 0.0
+        self._obstacle_collision_body_counts[env_ids] = 0.0
+        self._place_obstacle(env_ids)
+
+
+class WheelLeggedObstaclePerceptiveEnv(WheelLeggedObstacleOracleEnv):
+    """Obstacle task whose controller and actor observe calibrated depth only."""
+
+    def __init__(self, cfg, **kwargs):
+        super().__init__(cfg, **kwargs)
+        perception = self.cfg.obstacle_perception
+        sample_count = len(perception.scan_distances)
+        self.obstacle_depth_scan = torch.zeros(
+            self.num_envs, sample_count, device=self.device
+        )
+        self.obstacle_perception_distance = torch.full(
+            (self.num_envs,), perception.max_distance, device=self.device
+        )
+        self.obstacle_perception_height = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.obstacle_perception_width = torch.full(
+            (self.num_envs,), perception.width_prior, device=self.device
+        )
+        self.obstacle_perception_valid = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        # A low obstacle inevitably leaves the camera's vertical field of view
+        # shortly before take-off.  Keep its last depth estimate alive with
+        # base odometry instead of treating the near-field blind spot as a new
+        # "no obstacle" observation.
+        self._obstacle_perception_last_root_xy = (
+            self._robot.data.root_pos_w[:, :2].clone()
+        )
+        self._depth_pixel_cache = None
+        self._reset_obstacle_perception(
+            torch.arange(self.num_envs, device=self.device)
+        )
+
+    def _reset_obstacle_perception(self, env_ids: torch.Tensor):
+        if not hasattr(self, "obstacle_depth_scan") or len(env_ids) == 0:
+            return
+        perception = self.cfg.obstacle_perception
+        self.obstacle_depth_scan[env_ids] = 0.0
+        self.obstacle_perception_distance[env_ids] = perception.max_distance
+        self.obstacle_perception_height[env_ids] = 0.0
+        self.obstacle_perception_width[env_ids] = perception.width_prior
+        self.obstacle_perception_valid[env_ids] = False
+        self._obstacle_perception_last_root_xy[env_ids] = (
+            self._robot.data.root_pos_w[env_ids, :2]
+        )
+
+    def _depth_pixels(self, height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = self._depth_pixel_cache
+        if cache is None or cache[0] != height or cache[1] != width:
+            rows, columns = torch.meshgrid(
+                torch.arange(height, device=self.device, dtype=torch.float32),
+                torch.arange(width, device=self.device, dtype=torch.float32),
+                indexing="ij",
+            )
+            cache = (height, width, columns.reshape(1, -1), rows.reshape(1, -1))
+            self._depth_pixel_cache = cache
+        return cache[2], cache[3]
+
+    def _update_depth_obstacle_perception(self):
+        perception = self.cfg.obstacle_perception
+        camera = self.scene.sensors[perception.sensor_name]
+        root_position = self._robot.data.root_pos_w
+        root_quat = self._robot.data.root_quat_w
+        forward_body = torch.zeros(self.num_envs, 3, device=self.device)
+        forward_body[:, 0] = 1.0
+        forward = quat_apply(root_quat, forward_body)
+        forward_xy = torch.nn.functional.normalize(forward[:, :2], dim=1)
+
+        # Propagate an already detected obstacle through the camera's close
+        # blind zone. This uses only deployable base odometry, not simulator
+        # obstacle truth. A fresh depth return below overwrites the prediction.
+        root_motion = root_position[:, :2] - self._obstacle_perception_last_root_xy
+        forward_motion = torch.sum(root_motion * forward_xy, dim=1)
+        tracking = self.obstacle_perception_valid & ~self.obstacle_trial_triggered
+        self.obstacle_perception_distance[tracking] -= forward_motion[tracking]
+        self.obstacle_perception_distance.clamp_(
+            min=-perception.width_max, max=perception.max_distance
+        )
+        self._obstacle_perception_last_root_xy[:] = root_position[:, :2]
+
+        depth = camera.data.output.get("distance_to_image_plane")
+        if depth is None:
+            self._reconstruct_tracked_depth_scan()
+            return
+        if depth.ndim == 4:
+            depth = depth[..., 0]
+        height, width = depth.shape[1:]
+        column, row = self._depth_pixels(height, width)
+        depth = depth.reshape(self.num_envs, -1)
+        intrinsics = camera.data.intrinsic_matrices
+        fx = intrinsics[:, 0, 0].unsqueeze(1)
+        fy = intrinsics[:, 1, 1].unsqueeze(1)
+        cx = intrinsics[:, 0, 2].unsqueeze(1)
+        cy = intrinsics[:, 1, 2].unsqueeze(1)
+
+        valid_depth = (
+            torch.isfinite(depth)
+            & (depth > 0.05)
+            & (depth < perception.max_distance)
+        )
+        safe_depth = torch.where(valid_depth, depth, torch.zeros_like(depth))
+        if hasattr(camera, "ray_hits_w"):
+            # The training sensor already exposes its calibrated ray hits. A
+            # physical depth image follows the deprojection branch below and
+            # produces the same world-space point representation.
+            points_world = camera.ray_hits_w.reshape(self.num_envs, -1, 3)
+        else:
+            points_camera = torch.stack(
+                (
+                    (column - cx) * safe_depth / fx,
+                    (row - cy) * safe_depth / fy,
+                    safe_depth,
+                ),
+                dim=-1,
+            )
+            point_count = points_camera.shape[1]
+            camera_quat = camera.data.quat_w_ros[:, None, :].expand(
+                -1, point_count, -1
+            )
+            points_world = quat_apply(camera_quat, points_camera)
+            points_world += camera.data.pos_w[:, None, :]
+
+        lateral_xy = torch.stack((-forward_xy[:, 1], forward_xy[:, 0]), dim=1)
+        delta_xy = points_world[..., :2] - root_position[:, None, :2]
+        longitudinal = torch.sum(delta_xy * forward_xy[:, None, :], dim=-1)
+        lateral = torch.sum(delta_xy * lateral_xy[:, None, :], dim=-1)
+        ground_height = self.scene.env_origins[:, 2].unsqueeze(1)
+        point_height = points_world[..., 2] - ground_height
+        # The training ray caster represents the output of a conventional
+        # depth-camera ground-plane removal stage: rays are evaluated against
+        # elevated scene geometry after the support plane is rejected. On the
+        # real robot the same mask is obtained from calibrated depth + IMU.
+        elevated_depth_return = point_height > perception.minimum_point_height
+        obstacle_point = (
+            valid_depth
+            & elevated_depth_return
+            & (longitudinal > 0.05)
+            & (longitudinal < perception.max_distance)
+            & (lateral.abs() < perception.lateral_half_width)
+            & (point_height > perception.minimum_point_height)
+            & (point_height < perception.maximum_point_height)
+        )
+        valid_count = obstacle_point.sum(dim=1)
+        detected = valid_count >= perception.minimum_valid_points
+
+        positive_inf = torch.full_like(longitudinal, float("inf"))
+        negative_inf = torch.full_like(longitudinal, -float("inf"))
+        near = torch.where(obstacle_point, longitudinal, positive_inf).amin(dim=1)
+        far = torch.where(obstacle_point, longitudinal, negative_inf).amax(dim=1)
+        estimated_height = torch.where(
+            obstacle_point, point_height, negative_inf
+        ).amax(dim=1)
+        observed_width = far - near
+        estimated_width = torch.where(
+            observed_width >= perception.width_min,
+            observed_width,
+            torch.full_like(observed_width, perception.width_prior),
+        ).clamp(perception.width_min, perception.width_max)
+
+        # Before triggering, refresh the estimate whenever the obstacle is
+        # visible. Once triggered, retain it through crouch/thrust even if the
+        # camera can no longer see the very close barrier.
+        refresh = detected & ~self.obstacle_trial_triggered
+        self.obstacle_perception_distance[refresh] = near[refresh]
+        self.obstacle_perception_height[refresh] = estimated_height[refresh]
+        self.obstacle_perception_width[refresh] = estimated_width[refresh]
+        self.obstacle_perception_valid |= detected | self.obstacle_trial_triggered
+        self._reconstruct_tracked_depth_scan()
+
+    def _reconstruct_tracked_depth_scan(self):
+        """Build the Oracle-compatible 10-bin scan from the tracked geometry.
+
+        Depth supplies the geometry when the target is visible; odometry moves
+        that geometry through the final near-field blind zone.  This is the
+        same compact interface intended for the real depth-camera pipeline.
+        """
+        perception = self.cfg.obstacle_perception
+        samples = torch.tensor(
+            perception.scan_distances, device=self.device
+        ).unsqueeze(0)
+        center_distance = (
+            self.obstacle_perception_distance
+            + 0.5 * self.obstacle_perception_width
+        ).unsqueeze(1)
+        half_width = 0.5 * self.obstacle_perception_width.unsqueeze(1)
+        hit = (
+            self.obstacle_perception_valid.unsqueeze(1)
+            & ((samples - center_distance).abs() <= half_width)
+        )
+        self.obstacle_depth_scan[:] = torch.where(
+            hit, self.obstacle_perception_height.unsqueeze(1), 0.0
+        )
+
+    def _obstacle_control_estimate(
+        self, near_distance: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._update_depth_obstacle_perception()
+        # Invalid frames cannot trigger a jump. ``max_distance`` is safely
+        # outside every trigger range and is replaced as soon as depth detects
+        # an elevated cluster.
+        distance = torch.where(
+            self.obstacle_perception_valid,
+            self.obstacle_perception_distance,
+            torch.full_like(near_distance, self.cfg.obstacle_perception.max_distance),
+        )
+        return (
+            distance,
+            self.obstacle_perception_height,
+            self.obstacle_perception_width,
+        )
+
+    def _append_perception_debug_metrics(self):
+        if not hasattr(self, "obstacle_perception_valid"):
+            return
+        log = dict(self.extras.get("log", {}))
+        # Keep reporting a latched detection after take-off.  Otherwise every
+        # successful trigger would immediately turn into an invalid sample and
+        # make the staged-training gate measure jump phase occupancy instead of
+        # perception reliability.  Errors are still evaluated only before the
+        # trigger, while exact geometry is available for diagnostics.
+        tracked = self.obstacle_perception_valid
+        valid = tracked & ~self.obstacle_trial_triggered
+        log["obstacle_perception_valid_rate"] = tracked.float().mean().item()
+        triggered = tracked & self.obstacle_trial_triggered
+        log["obstacle_perception_trigger_distance"] = (
+            self.obstacle_perception_distance[triggered].mean().item()
+            if triggered.any()
+            else 0.0
+        )
+        if valid.any():
+            root_delta = self._robot.data.root_pos_w[:, :2] - self.obstacle_position_w
+            exact_distance = -0.5 * self.obstacle_width - torch.sum(
+                root_delta * self.obstacle_forward_w, dim=1
+            )
+            log["obstacle_perception_distance_error"] = (
+                self.obstacle_perception_distance[valid] - exact_distance[valid]
+            ).abs().mean().item()
+            log["obstacle_perception_height_error"] = (
+                self.obstacle_perception_height[valid] - self.obstacle_height[valid]
+            ).abs().mean().item()
+            log["obstacle_perception_width_error"] = (
+                self.obstacle_perception_width[valid] - self.obstacle_width[valid]
+            ).abs().mean().item()
+            log["obstacle_perception_distance"] = (
+                self.obstacle_perception_distance[valid].mean().item()
+            )
+            log["obstacle_perception_height"] = (
+                self.obstacle_perception_height[valid].mean().item()
+            )
+            log["obstacle_perception_width"] = (
+                self.obstacle_perception_width[valid].mean().item()
+            )
+        else:
+            log["obstacle_perception_distance_error"] = 0.0
+            log["obstacle_perception_height_error"] = 0.0
+            log["obstacle_perception_width_error"] = 0.0
+            log["obstacle_perception_distance"] = 0.0
+            log["obstacle_perception_height"] = 0.0
+            log["obstacle_perception_width"] = 0.0
+        self.extras["log"] = log
 
     def _log_debug_metrics(self):
         super()._log_debug_metrics()
@@ -1102,19 +1530,10 @@ class WheelLeggedObstacleOracleEnv(WheelLeggedJumpEnv):
             self._obstacle_successes.sum() / trials
         ).item()
         self.extras["log"] = log
+        self._append_perception_debug_metrics()
 
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)
-        if not hasattr(self, "_obstacle_trials"):
-            return
-        self._obstacle_trials[env_ids] = 0.0
-        self._obstacle_clears[env_ids] = 0.0
-        self._obstacle_collisions[env_ids] = 0.0
-        self._obstacle_successes[env_ids] = 0.0
-        self._obstacle_collision_force_sum[env_ids] = 0.0
-        self._obstacle_collision_force_peak[env_ids] = 0.0
-        self._obstacle_collision_body_counts[env_ids] = 0.0
-        self._place_obstacle(env_ids)
 
 
 @configclass
@@ -1178,6 +1597,31 @@ class WheelLeggedObstacleObservationsCfg(WheelLeggedJumpObservationsCfg):
             clip=(0.0, 0.10),
             scale=10.0,
         )
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class WheelLeggedPerceptiveObstacleObservationsCfg(
+    WheelLeggedObstacleObservationsCfg
+):
+    """Depth-derived actor scan with an asymmetric Oracle critic scan."""
+
+    @configclass
+    class PolicyCfg(WheelLeggedJumpObservationsCfg.PolicyCfg):
+        obstacle_forward_scan = ObsTerm(
+            func=mdp.depth_camera_obstacle_scan,
+            params={"sample_count": 10},
+            clip=(0.0, 0.10),
+            scale=10.0,
+        )
+
+    # The critic may use simulator geometry during training. It is discarded
+    # on export, while the deployed actor depends only on calibrated depth.
+    @configclass
+    class CriticCfg(WheelLeggedObstacleObservationsCfg.CriticCfg):
+        pass
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
@@ -1988,3 +2432,24 @@ class WheelLeggedObstacleOracleFlatEnvCfg(WheelLeggedTargetLandingFlatEnvCfg):
         # It removes borderline target misses from O成功 while clean crossing,
         # minimum wheel clearance, air time and landing speed remain mandatory.
         state.success_max_landing_position_error = 0.06
+
+
+@configclass
+class WheelLeggedObstaclePerceptiveFlatEnvCfg(
+    WheelLeggedObstacleOracleFlatEnvCfg
+):
+    """Stage D3: depth-perceived obstacle geometry and jump triggering."""
+
+    scene: WheelLeggedPerceptiveObstacleSceneCfg = (
+        WheelLeggedPerceptiveObstacleSceneCfg(num_envs=512, env_spacing=4.0)
+    )
+    observations: WheelLeggedPerceptiveObstacleObservationsCfg = (
+        WheelLeggedPerceptiveObstacleObservationsCfg()
+    )
+    obstacle_perception: ObstaclePerceptionCfg = ObstaclePerceptionCfg()
+    env_class = WheelLeggedObstaclePerceptiveEnv
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations = WheelLeggedPerceptiveObstacleObservationsCfg()
+        self.obstacle_perception = ObstaclePerceptionCfg()

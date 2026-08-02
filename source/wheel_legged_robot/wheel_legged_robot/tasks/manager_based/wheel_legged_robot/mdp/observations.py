@@ -87,6 +87,28 @@ def obstacle_forward_scan(
     hit = (samples - obstacle_from_root).abs() <= half_width
     return torch.where(hit, env.obstacle_height.unsqueeze(1), 0.0)
 
+
+def depth_camera_obstacle_scan(
+    env: ManagerBasedRLEnv,
+    sample_count: int = 10,
+) -> torch.Tensor:
+    """Return the deployable obstacle-height profile extracted from depth.
+
+    The perceptive environment updates this cache once per control step after
+    deprojecting the calibrated depth image into world-space points. Keeping
+    the output shape identical to :func:`obstacle_forward_scan` allows an
+    Oracle checkpoint to initialize the perceptive policy without changing
+    the actor architecture.
+    """
+    scan = getattr(env, "obstacle_depth_scan", None)
+    if scan is None:
+        return torch.zeros(env.num_envs, sample_count, device=env.device)
+    if scan.shape[1] != sample_count:
+        raise RuntimeError(
+            f"Depth obstacle scan has {scan.shape[1]} samples, expected {sample_count}."
+        )
+    return scan
+
 def base_mass(env) -> torch.Tensor:
     """返回基座质量减去所有环境均值，形状 (num_envs, 1)"""
     if hasattr(env, "_base_mass"):

@@ -102,7 +102,8 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
-# always enable cameras to record video
+# RTX cameras are only needed for video. The perceptive task uses the scalable
+# ray-cast depth backend and therefore remains available in normal headless mode.
 if args_cli.video:
     args_cli.enable_cameras = True
 
@@ -480,7 +481,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     min_action_std = args_cli.min_action_std
     max_action_std = args_cli.max_action_std
-    if args_cli.task == "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0":
+    if args_cli.task in (
+        "Wheel-Legged-Jump-Obstacle-Oracle-Flat-v0",
+        "Wheel-Legged-Jump-Obstacle-Perceptive-Flat-v0",
+    ):
         min_action_std = 0.10 if min_action_std is None else min_action_std
         max_action_std = 0.50 if max_action_std is None else max_action_std
     elif args_cli.task in (

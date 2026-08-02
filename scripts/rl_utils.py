@@ -99,6 +99,14 @@ WHEEL_LEGGED_DEBUG_METRICS: tuple[tuple[str, str], ...] = (
     ("obstacle_collision_lower_leg_fraction", "O撞小腿"),
     ("obstacle_collision_wheel_fraction", "O撞轮"),
     ("obstacle_success_rate", "O成功"),
+    ("obstacle_perception_valid_rate", "P有效"),
+    ("obstacle_perception_trigger_distance", "P触发距"),
+    ("obstacle_perception_distance_error", "P距误差"),
+    ("obstacle_perception_height_error", "P高误差"),
+    ("obstacle_perception_width_error", "P宽误差"),
+    ("obstacle_perception_distance", "P距离"),
+    ("obstacle_perception_height", "P高度"),
+    ("obstacle_perception_width", "P宽度"),
 )
 
 

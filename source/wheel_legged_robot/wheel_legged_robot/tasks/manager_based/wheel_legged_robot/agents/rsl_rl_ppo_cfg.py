@@ -163,6 +163,17 @@ class WheelLeggedObstacleOraclePPORunnerCfg(WheelLeggedTargetLandingPPORunnerCfg
 
 
 @configclass
+class WheelLeggedObstaclePerceptivePPORunnerCfg(
+    WheelLeggedObstacleOraclePPORunnerCfg
+):
+    """Depth-camera adaptation initialized from the Oracle obstacle policy."""
+
+    experiment_name = "wheel_legged_jump_obstacle_perceptive_flat"
+    max_iterations = 2000
+    save_interval = 100
+
+
+@configclass
 class WheelLeggedRecoveryPPORunnerCfg(WheelLeggedFlatPPORunnerCfg):
     """PPO runner for near-fall recovery and disturbance rejection."""
 
